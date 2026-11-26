@@ -9306,6 +9306,7 @@ private class DragGestureHandler {
     var dragging: Bool = false  // distance threshold exceeded, drag is active
     var startX: Double = 0
     var startY: Double = 0
+    var interactiveHost: Win32ViewHost?
 
     init(onChanged: ((DragGestureValue) -> Void)?, onEnded: ((DragGestureValue) -> Void)?,
          minimumDistance: Double, rootHwnd: HWND) {
@@ -9313,6 +9314,22 @@ private class DragGestureHandler {
         self.onEnded = onEnded
         self.minimumDistance = minimumDistance
         self.rootHwnd = rootHwnd
+    }
+
+    /// Defer state-driven rebuilds while the pointer is down: a rebuild destroys
+    /// the gesture's HWND and would drop pointer capture mid-drag. D2D content
+    /// repaints locally through RedrawWindow instead.
+    func beginInteractiveIfNeeded() {
+        guard interactiveHost == nil else { return }
+        guard let host = findContainingViewHost(from: rootHwnd) else { return }
+        host.beginInteractiveUpdate()
+        interactiveHost = host
+    }
+
+    func endInteractiveIfNeeded() {
+        guard let host = interactiveHost else { return }
+        interactiveHost = nil
+        host.endInteractiveUpdate()
     }
 }
 
@@ -9335,6 +9352,7 @@ private let dragGestureProc: SUBCLASSPROC = { (hwnd, uMsg, wParam, lParam, uIdSu
         handler.startY = Double(pt.y)
         handler.tracking = true
         handler.dragging = false
+        handler.beginInteractiveIfNeeded()
         SetCapture(handler.rootHwnd)
         return DefSubclassProc(hwnd, uMsg, wParam, lParam)
 
@@ -9372,7 +9390,6 @@ private let dragGestureProc: SUBCLASSPROC = { (hwnd, uMsg, wParam, lParam, uIdSu
             let wasDragging = handler.dragging
             handler.tracking = false
             handler.dragging = false
-            ReleaseCapture()
             if wasDragging {
                 var pt = POINT(x: LONG(win32_GET_X_LPARAM(lParam)), y: LONG(win32_GET_Y_LPARAM(lParam)))
                 if hwnd != handler.rootHwnd {
@@ -9390,15 +9407,21 @@ private let dragGestureProc: SUBCLASSPROC = { (hwnd, uMsg, wParam, lParam, uIdSu
                 // Invalidate so Canvas repaints with the committed stroke
                 RedrawWindow(hwnd, nil, nil, UINT(RDW_INVALIDATE | RDW_ALLCHILDREN))
             }
+            ReleaseCapture()
+            handler.endInteractiveIfNeeded()
         }
         return DefSubclassProc(hwnd, uMsg, wParam, lParam)
 
     case UINT(WM_CAPTURECHANGED):
-        handler.tracking = false
-        handler.dragging = false
+        if handler.tracking {
+            handler.tracking = false
+            handler.dragging = false
+            handler.endInteractiveIfNeeded()
+        }
         return DefSubclassProc(hwnd, uMsg, wParam, lParam)
 
     case UINT(WM_NCDESTROY):
+        handler.endInteractiveIfNeeded()
         Unmanaged<DragGestureHandler>.fromOpaque(
             UnsafeMutableRawPointer(bitPattern: UInt(dwRefData))!
         ).release()
