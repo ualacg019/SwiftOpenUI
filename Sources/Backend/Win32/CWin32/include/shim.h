@@ -59,19 +59,21 @@ static inline LPCWSTR win32_MAKEINTRESOURCEW(WORD id) {
 // --- Macro expansions: color ---
 
 static inline COLORREF win32_RGB(BYTE r, BYTE g, BYTE b) {
-    return RGB(r, g, b);
+    return (COLORREF)(((DWORD)(BYTE)(r)) |
+                      (((DWORD)(BYTE)(g)) << 8) |
+                      (((DWORD)(BYTE)(b)) << 16));
 }
 
 static inline BYTE win32_GetRValue(COLORREF color) {
-    return GetRValue(color);
+    return (BYTE)(((DWORD)(color)) & 0xFF);
 }
 
 static inline BYTE win32_GetGValue(COLORREF color) {
-    return GetGValue(color);
+    return (BYTE)((((DWORD)(color)) >> 8) & 0xFF);
 }
 
 static inline BYTE win32_GetBValue(COLORREF color) {
-    return GetBValue(color);
+    return (BYTE)((((DWORD)(color)) >> 16) & 0xFF);
 }
 
 // --- Window class names as functions (Swift can't use L"" string literals) ---
