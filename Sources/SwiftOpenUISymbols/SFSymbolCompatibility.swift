@@ -86,6 +86,9 @@ public enum SFSymbolCompatibility {
         "checkmark.circle":       "check_circle",
         "checkmark.circle.fill":  "check_circle",
         "checkmark.seal.fill":    "verified",
+        "checklist":              "checklist",
+        "circle":                 "radio_button_unchecked",
+        "circle.fill":            "circle",
         "exclamationmark.triangle": "warning",
         "exclamationmark.triangle.fill": "warning",
         "info.circle":            "info",
@@ -119,6 +122,7 @@ public enum SFSymbolCompatibility {
         // MARK: UI primitives
         "bell":                   "notifications",
         "bell.fill":              "notifications",
+        "globe":                  "globe",
         "bookmark":               "bookmark",
         "books.vertical":         "library_books",
         "books.vertical.fill":    "library_books",

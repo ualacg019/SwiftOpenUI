@@ -4034,7 +4034,9 @@ extension Label: GTKRenderable {
         let box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6)!
 
         if let iconName = systemImage {
-            let img = gtk_image_new_from_icon_name(iconName)!
+            // Same SF Symbols → Material path as Image(systemName:); the GTK
+            // icon theme doesn't know SF Symbol names.
+            let img = widgetFromOpaque(gtkRenderView(Image(systemName: iconName)))
             gtk_box_append(boxPointer(box), img)
         } else if let path = imagePath {
             let img = gtk_image_new_from_file(path)!
@@ -6211,6 +6213,13 @@ extension DatePicker: GTKRenderable {
             GConnectFlags(rawValue: 0)
         )
 
+        // Hour and minute below the calendar (displayedComponents .hourAndMinute).
+        if let timeControls {
+            let timeWidget = widgetFromOpaque(gtkRenderView(timeControls))
+            gtk_widget_set_halign(timeWidget, GTK_ALIGN_START)
+            gtk_box_append(boxPtr, timeWidget)
+        }
+
         gtkApplyEnabledState(to: box)
         return opaqueFromWidget(box)
     }
@@ -6734,9 +6743,27 @@ extension ToolbarItem: GTKRenderable {
 
 extension ToolbarView: GTKRenderable {
     public func gtkCreateWidget() -> OpaquePointer {
-        // Render the content; toolbar items are extracted by NavigationStack
-        // via the ToolbarProvider protocol during header bar construction.
-        gtkRenderView(content)
+        // Inside a NavigationStack, the stack extracts the toolbar items via
+        // the ToolbarProvider protocol when it builds its header bar.
+        let widget = gtkRenderView(content)
+        guard !gtkIsInsideNavigationStack() else { return widget }
+
+        // Outside one, the items go to the window's header bar, as SwiftUI puts
+        // them in the window toolbar on macOS.
+        let (items, hidden) = gtkApplyToolbarConfiguration(
+            items: toolbarItems, configuration: toolbarConfiguration)
+        guard !hidden, !items.isEmpty else { return widget }
+        let headerBar = gtkWindowHeaderBar(attachedTo: widgetFromOpaque(widget))
+        for item in gtkHeaderBarPackingOrder(items, \.placement) {
+            let itemWidget = widgetFromOpaque(gtkRenderAnyView(item.wrapped))
+            switch item.placement {
+            case .leading:
+                gtk_header_bar_pack_start(headerBar, itemWidget)
+            case .primaryAction, .trailing:
+                gtk_header_bar_pack_end(headerBar, itemWidget)
+            }
+        }
+        return widget
     }
 }
 
@@ -7381,6 +7408,37 @@ private func gtkRenderStatefulView<V: View>(_ view: V) -> OpaquePointer {
 
     installState(view, host: host)
 
+    // Inside a host's tracked body pass, build the body after that pass
+    // (see gtkDeferStatefulBuild), with the render context of this point.
+    let environment = getCurrentEnvironment()
+    let navigationContext = getCurrentNavigationContext()
+    let foregroundColor = _gtkCurrentForegroundColor
+    let tagValue = getCurrentTagValue()
+    let animation = getCurrentAnimation()
+    let deferred = gtkDeferStatefulBuild {
+        let saved = (getCurrentEnvironment(), getCurrentNavigationContext(),
+                     _gtkCurrentForegroundColor, getCurrentTagValue(), getCurrentAnimation())
+        setCurrentEnvironment(environment)
+        setCurrentNavigationContext(navigationContext)
+        _gtkCurrentForegroundColor = foregroundColor
+        if let tagValue { setCurrentTagValue(tagValue) } else { clearCurrentTagValue() }
+        setCurrentAnimation(animation)
+        gtkBuildStatefulBody(view, host: host)
+        setCurrentEnvironment(saved.0)
+        setCurrentNavigationContext(saved.1)
+        _gtkCurrentForegroundColor = saved.2
+        if let tag = saved.3 { setCurrentTagValue(tag) } else { clearCurrentTagValue() }
+        setCurrentAnimation(saved.4)
+    }
+    if !deferred {
+        gtkBuildStatefulBody(view, host: host)
+    }
+    return opaqueFromWidget(host.container)
+}
+
+/// Build a stateful view's body into its host's container, under the host's
+/// own observation and dependency tracking.
+private func gtkBuildStatefulBody<V: View>(_ view: V, host: GTKViewHost) {
     let previousHost = GTKViewHost.getCurrentRebuilding()
     GTKViewHost.setCurrentRebuilding(host)
     beginDependencyTracking()
@@ -7431,8 +7489,6 @@ private func gtkRenderStatefulView<V: View>(_ view: V) -> OpaquePointer {
         )
         host.retainedExecutor = executor
     }
-
-    return opaqueFromWidget(host.container)
 }
 
 // MARK: - Safe Area GTK extensions

@@ -7,6 +7,35 @@ import Foundation
 import Observation
 #endif
 
+// MARK: - Stateful children built outside the parent's tracking
+
+/// `withObservationTracking` merges the reads of a nested tracking scope into
+/// the enclosing one, so a stateful child rendered during its parent's
+/// tracked body pass credited every @Observable read (its own view model,
+/// say) to the parent too: a change only the child cares about rebuilt the
+/// parent, re-creating the child and losing its navigation. While a host
+/// tracks its body, stateful children only get their container; their bodies
+/// are built right after the parent's tracking closure returns, each under
+/// its own tracking. (Same scheme as the GTK4 backend.)
+private var win32DeferredStatefulFrames: [[() -> Void]] = []
+
+/// Queue a stateful child's build for after the current host's tracked body
+/// pass. Returns false (and queues nothing) when no host is tracking.
+func win32DeferStatefulBuild(_ build: @escaping () -> Void) -> Bool {
+    guard !win32DeferredStatefulFrames.isEmpty else { return false }
+    win32DeferredStatefulFrames[win32DeferredStatefulFrames.count - 1].append(build)
+    return true
+}
+
+/// Run `body` collecting the stateful-child builds it queues, then return
+/// them for the caller to run outside its tracking scope.
+func win32CollectingStatefulBuilds<T>(_ body: () -> T) -> (T, [() -> Void]) {
+    win32DeferredStatefulFrames.append([])
+    let result = body()
+    let builds = win32DeferredStatefulFrames.removeLast()
+    return (result, builds)
+}
+
 /// Hosts a stateful view's Win32 HWND subtree. The container HWND
 /// is stable across re-renders; only its children are replaced.
 ///
@@ -77,6 +106,28 @@ public class Win32ViewHost: AnyViewHost, DependencyTrackingHost {
 
     /// The root window to post rebuild messages to.
     private var rootWindow: HWND?
+
+    /// The host whose body is being evaluated (initial render or rebuild).
+    /// Views rendered during that evaluation belong to this host.
+    static var current: Win32ViewHost?
+
+    /// Positional cache of nested stateful children's storages, so their
+    /// @State / @StateObject survive a rebuild of this host (the rebuild
+    /// constructs the child views again with new storages). Keyed by
+    /// "<render-order index>:<view type>", as in the GTK4 view host.
+    var childStateCache: [String: [AnyStateStorage]] = [:]
+
+    /// Pushed entries of the NavigationStacks in this host's body, by the same
+    /// positional key, so a rebuild re-opens them instead of resetting to root.
+    var navigationMemory: [String: Win32NavigationMemory] = [:]
+
+    private var childCounter = 0
+
+    /// Next positional key for a child rendered during the current body pass.
+    func nextChildKey(type: String) -> String {
+        defer { childCounter += 1 }
+        return "\(childCounter):\(type)"
+    }
 
     public init(context: RenderContext,
                 buildBody: @escaping (RenderContext) -> HWND?,
@@ -200,6 +251,12 @@ public class Win32ViewHost: AnyViewHost, DependencyTrackingHost {
 
     /// Build the body with observation tracking for @Observable support.
     public func buildBodyWithTracking(_ context: RenderContext) -> HWND? {
+        // Views rendered while the body evaluates belong to this host.
+        let previousHost = Win32ViewHost.current
+        Win32ViewHost.current = self
+        childCounter = 0
+        defer { Win32ViewHost.current = previousHost }
+
         // Track `@Environment(Type.self)` reads so we can re-push the
         // same objects into env on rebuild even if the pushing
         // modifier lives below us in the render tree. Pairs with
@@ -209,8 +266,9 @@ public class Win32ViewHost: AnyViewHost, DependencyTrackingHost {
         #if canImport(Observation)
         if #available(macOS 14.0, iOS 17.0, *) {
             var result: HWND?
+            var childBuilds: [() -> Void] = []
             withObservationTracking {
-                result = buildBody(context)
+                (result, childBuilds) = win32CollectingStatefulBuilds { buildBody(context) }
             } onChange: { [weak self] in
                 guard let self else { return }
                 self.lock.lock()
@@ -221,6 +279,8 @@ public class Win32ViewHost: AnyViewHost, DependencyTrackingHost {
             if let reads = endEnvironmentReadTracking() {
                 capturedInjectedObjects = reads
             }
+            // Stateful children: built now, outside this host's tracking.
+            for build in childBuilds { build() }
             return result
         }
         #endif
