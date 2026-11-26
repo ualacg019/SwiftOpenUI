@@ -9304,6 +9304,7 @@ private class DragGestureHandler {
     let rootHwnd: HWND
     var tracking: Bool = false  // mouse is down, but drag may not have started
     var dragging: Bool = false  // distance threshold exceeded, drag is active
+    var interactive: Bool = false  // rebuilds deferred while the drag is in flight
     var startX: Double = 0
     var startY: Double = 0
 
@@ -9336,6 +9337,12 @@ private let dragGestureProc: SUBCLASSPROC = { (hwnd, uMsg, wParam, lParam, uIdSu
         handler.tracking = true
         handler.dragging = false
         SetCapture(handler.rootHwnd)
+        // Defer rebuilds for the whole drag so the Canvas that owns the
+        // gesture is not destroyed mid-drag (matches the Slider pattern).
+        if !handler.interactive {
+            findContainingViewHost(from: handler.rootHwnd)?.beginInteractiveUpdate()
+            handler.interactive = true
+        }
         return DefSubclassProc(hwnd, uMsg, wParam, lParam)
 
     case UINT(WM_MOUSEMOVE):
@@ -9372,7 +9379,6 @@ private let dragGestureProc: SUBCLASSPROC = { (hwnd, uMsg, wParam, lParam, uIdSu
             let wasDragging = handler.dragging
             handler.tracking = false
             handler.dragging = false
-            ReleaseCapture()
             if wasDragging {
                 var pt = POINT(x: LONG(win32_GET_X_LPARAM(lParam)), y: LONG(win32_GET_Y_LPARAM(lParam)))
                 if hwnd != handler.rootHwnd {
@@ -9390,15 +9396,29 @@ private let dragGestureProc: SUBCLASSPROC = { (hwnd, uMsg, wParam, lParam, uIdSu
                 // Invalidate so Canvas repaints with the committed stroke
                 RedrawWindow(hwnd, nil, nil, UINT(RDW_INVALIDATE | RDW_ALLCHILDREN))
             }
+            // End the deferred-rebuild window and flush the pending rebuild.
+            if handler.interactive {
+                findContainingViewHost(from: handler.rootHwnd)?.endInteractiveUpdate()
+                handler.interactive = false
+            }
+            ReleaseCapture()
         }
         return DefSubclassProc(hwnd, uMsg, wParam, lParam)
 
     case UINT(WM_CAPTURECHANGED):
         handler.tracking = false
         handler.dragging = false
+        if handler.interactive {
+            findContainingViewHost(from: handler.rootHwnd)?.endInteractiveUpdate()
+            handler.interactive = false
+        }
         return DefSubclassProc(hwnd, uMsg, wParam, lParam)
 
     case UINT(WM_NCDESTROY):
+        if handler.interactive {
+            findContainingViewHost(from: handler.rootHwnd)?.endInteractiveUpdate()
+            handler.interactive = false
+        }
         Unmanaged<DragGestureHandler>.fromOpaque(
             UnsafeMutableRawPointer(bitPattern: UInt(dwRefData))!
         ).release()
