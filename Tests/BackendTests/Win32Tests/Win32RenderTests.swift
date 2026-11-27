@@ -4779,3 +4779,161 @@ private func findFlatButton(in parent: HWND, titled title: String) -> HWND? {
     }
     return nil
 }
+
+// MARK: - Regression tests for deferred stateful children, ScrollView sizing, and DragGesture
+
+@Observable
+private final class RegressionObservableModel {
+    var items: [String] = ["Initial"]
+}
+
+private struct RegressionChildWithObservableView: View {
+    let model: RegressionObservableModel
+    @State var isEditing = false
+    let onParentStateCheck: (() -> Void)? = nil
+
+    var body: some View {
+        VStack(spacing: 4) {
+            Text("Count: \(model.items.count)")
+            Text(isEditing ? "Editing" : "Idle")
+        }
+    }
+}
+
+private struct RegressionParentWithStateView: View {
+    @State var parentSelection: String = "root"
+    let model: RegressionObservableModel
+
+    var body: some View {
+        VStack(spacing: 4) {
+            Text("Parent: \(parentSelection)")
+            RegressionChildWithObservableView(model: model)
+        }
+    }
+}
+
+private struct RegressionScrollChildView: View {
+    let model: RegressionObservableModel
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Color.blue.frame(width: 200, height: 400)
+            Text("Items: \(model.items.count)")
+        }
+    }
+}
+
+private struct RegressionParentWithScrollView: View {
+    @State var active = true
+    let model: RegressionObservableModel
+
+    var body: some View {
+        ScrollView {
+            RegressionScrollChildView(model: model)
+        }
+    }
+}
+
+private struct RegressionDragCanvasView: View {
+    @State var dragCount = 0
+
+    var body: some View {
+        Canvas(width: 120, height: 120) { _, _, _ in }
+            .onDrag(
+                minimumDistance: 0,
+                onChanged: { _ in dragCount += 1 },
+                onEnded: { _ in dragCount += 1 }
+            )
+    }
+}
+
+extension Win32RenderTests {
+    func testStatefulChildObservableMutationDoesNotRebuildParent() {
+        let ctx = testContext()
+        let model = RegressionObservableModel()
+        let root = winRenderView(RegressionParentWithStateView(model: model), in: ctx)
+        XCTAssertNotNil(root)
+
+        let childHost = findFirstViewHost(in: root!, excluding: root!)
+        XCTAssertNotNil(childHost, "Expected nested Win32ViewHost for child view")
+        let initialChildID = childHost.map { ObjectIdentifier($0) }
+
+        model.items.append("Second")
+        pumpWindowMessages(for: testWindow, timeoutMs: 30)
+
+        let childHostAfter = findFirstViewHost(in: root!, excluding: root!)
+        XCTAssertEqual(childHostAfter.map { ObjectIdentifier($0) }, initialChildID,
+                       "Mutating child's @Observable must not rebuild the parent host and replace the child host")
+    }
+
+    func testDeferredStatefulChildInsideScrollViewPreservesContentHeight() {
+        let ctx = testContext()
+        let model = RegressionObservableModel()
+        let root = winRenderView(RegressionParentWithScrollView(model: model), in: ctx)
+        XCTAssertNotNil(root)
+
+        let scrollHwnd = findWindowByClass(in: root!, className: "SwiftUIScrollView")
+        XCTAssertNotNil(scrollHwnd, "Expected SwiftUIScrollView HWND")
+
+        if let scrollHwnd {
+            var si = SCROLLINFO()
+            si.cbSize = UINT(MemoryLayout<SCROLLINFO>.size)
+            si.fMask = UINT(SIF_RANGE)
+            GetScrollInfo(scrollHwnd, INT(SB_VERT), &si)
+            XCTAssertGreaterThan(si.nMax, 200, "ScrollView contentHeight should reflect the deferred child's 400pt height, not 0")
+        }
+    }
+
+    func testDragGestureDefersRebuildDuringDrag() {
+        let ctx = testContext()
+        let root = winRenderView(RegressionDragCanvasView(), in: ctx)
+        XCTAssertNotNil(root)
+
+        let canvasHwnd = findWindowByClass(in: root!, className: "SwiftUID2DSurface")
+        XCTAssertNotNil(canvasHwnd, "Expected Canvas HWND")
+        guard let canvasHwnd else { return }
+
+        let lParam = LPARAM((20 & 0xFFFF) | ((20 & 0xFFFF) << 16))
+        _ = SendMessageW(canvasHwnd, UINT(WM_LBUTTONDOWN), WPARAM(MK_LBUTTON), lParam)
+        _ = SendMessageW(canvasHwnd, UINT(WM_MOUSEMOVE), WPARAM(MK_LBUTTON), LPARAM((35 & 0xFFFF) | ((35 & 0xFFFF) << 16)))
+        pumpWindowMessages(for: testWindow, timeoutMs: 30)
+
+        XCTAssertTrue(IsWindow(canvasHwnd), "Canvas HWND must survive during drag even when onChanged mutates @State")
+
+        _ = SendMessageW(canvasHwnd, UINT(WM_LBUTTONUP), 0, LPARAM((35 & 0xFFFF) | ((35 & 0xFFFF) << 16)))
+        pumpWindowMessages(for: testWindow, timeoutMs: 30)
+    }
+}
+
+private func findFirstViewHost(in parent: HWND, excluding: HWND) -> Win32ViewHost? {
+    var child = GetWindow(parent, UINT(GW_CHILD))
+    while let c = child {
+        if c != excluding, className(of: c) == "SwiftUIContainer" {
+            let userData = win32_GetWindowLongPtrW(c, GWLP_USERDATA)
+            if userData != 0 {
+                return Unmanaged<Win32ViewHost>.fromOpaque(
+                    UnsafeMutableRawPointer(bitPattern: Int(userData))!
+                ).takeUnretainedValue()
+            }
+        }
+        if let nested = findFirstViewHost(in: c, excluding: excluding) {
+            return nested
+        }
+        child = GetWindow(c, UINT(GW_HWNDNEXT))
+    }
+    return nil
+}
+
+private func findWindowByClass(in parent: HWND, className targetClass: String) -> HWND? {
+    if className(of: parent) == targetClass {
+        return parent
+    }
+    var child = GetWindow(parent, UINT(GW_CHILD))
+    while let c = child {
+        if let found = findWindowByClass(in: c, className: targetClass) {
+            return found
+        }
+        child = GetWindow(c, UINT(GW_HWNDNEXT))
+    }
+    return nil
+}

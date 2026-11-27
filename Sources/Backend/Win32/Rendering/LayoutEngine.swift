@@ -1,5 +1,6 @@
 import WinSDK
 import CWin32
+import CWin32Bridge
 import SwiftOpenUI
 
 /// Default body text size in logical points. Text is measured and drawn at
@@ -127,7 +128,7 @@ class StackLayoutInfo {
     let crossAlignment: Int
     /// Each child's natural (intrinsic) size, captured at creation time.
     /// Used to avoid stretching leaf controls to fill the cross-axis.
-    let naturalSizes: [(width: Int32, height: Int32)]
+    var naturalSizes: [(width: Int32, height: Int32)]
 
     init(direction: StackDirection, spacing: Int32, children: [HWND],
          flexibleIndices: Set<Int>, crossAlignment: Int = 1) {
@@ -142,6 +143,22 @@ class StackLayoutInfo {
             GetWindowRect(child, &r)
             return (width: r.right - r.left, height: r.bottom - r.top)
         }
+    }
+
+    @discardableResult
+    func refreshNaturalSize(for child: HWND) -> Bool {
+        guard let idx = children.firstIndex(of: child) else { return false }
+        var r = RECT()
+        GetWindowRect(child, &r)
+        naturalSizes[idx] = (width: r.right - r.left, height: r.bottom - r.top)
+        return true
+    }
+}
+
+/// Notify the parent container that a deferred child host updated its natural size.
+func win32NotifyChildSizeChanged(_ child: HWND) {
+    if let parent = GetParent(child) {
+        _ = SendMessageW(parent, WM_SWIFTUI_CHILD_SIZE_CHANGED, 0, LPARAM(Int(bitPattern: child)))
     }
 }
 
@@ -715,6 +732,40 @@ let stackLayoutProc: SUBCLASSPROC = { (hwnd, uMsg, wParam, lParam, uIdSubclass, 
         SetBkMode(hdc, TRANSPARENT)
         return LRESULT(Int(bitPattern: GetSysColorBrush(COLOR_WINDOW)))
 
+    case WM_SWIFTUI_CHILD_SIZE_CHANGED:
+        if dwRefData != 0 {
+            let info = Unmanaged<StackLayoutInfo>.fromOpaque(
+                UnsafeMutableRawPointer(bitPattern: UInt(dwRefData))!
+            ).takeUnretainedValue()
+            if let child = HWND(bitPattern: Int(lParam)) {
+                info.refreshNaturalSize(for: child)
+            }
+            if info.children.contains(where: { shouldExpandHeight($0) }) {
+                markExpandHeight(hwnd!)
+            }
+            if info.children.contains(where: { shouldExpandWidth($0) }) {
+                markExpandWidth(hwnd!)
+            }
+            let natural = computeNaturalSize(info: info)
+            var cur = RECT()
+            GetWindowRect(hwnd!, &cur)
+            let curW = cur.right - cur.left
+            let curH = cur.bottom - cur.top
+            let targetW = max(curW, natural.width)
+            let targetH = max(curH, natural.height)
+            if targetW != curW || targetH != curH {
+                SetWindowPos(hwnd!, nil, 0, 0, targetW, targetH, UINT(SWP_NOZORDER | SWP_NOMOVE))
+            }
+            switch info.direction {
+            case .vertical:
+                performVerticalLayout(container: hwnd!, info: info)
+            case .horizontal:
+                performHorizontalLayout(container: hwnd!, info: info)
+            }
+            win32NotifyChildSizeChanged(hwnd!)
+        }
+        return 0
+
     case UINT(WM_NCDESTROY):
         if dwRefData != 0 {
             Unmanaged<StackLayoutInfo>.fromOpaque(
@@ -770,6 +821,32 @@ let zStackLayoutProc: SUBCLASSPROC = { (hwnd, uMsg, wParam, lParam, uIdSubclass,
             return SendMessageW(parent, uMsg, wParam, lParam)
         }
         return DefSubclassProc(hwnd, uMsg, wParam, lParam)
+
+    case WM_SWIFTUI_CHILD_SIZE_CHANGED:
+        if dwRefData != 0 {
+            let info = Unmanaged<ZStackLayoutInfo>.fromOpaque(
+                UnsafeMutableRawPointer(bitPattern: UInt(dwRefData))!
+            ).takeUnretainedValue()
+            if info.children.contains(where: { shouldExpandWidth($0) }) {
+                markExpandWidth(hwnd!)
+            }
+            if info.children.contains(where: { shouldExpandHeight($0) }) {
+                markExpandHeight(hwnd!)
+            }
+            let natural = computeZStackNaturalSize(info: info)
+            var cur = RECT()
+            GetWindowRect(hwnd!, &cur)
+            let curW = cur.right - cur.left
+            let curH = cur.bottom - cur.top
+            let targetW = max(curW, natural.width)
+            let targetH = max(curH, natural.height)
+            if targetW != curW || targetH != curH {
+                SetWindowPos(hwnd!, nil, 0, 0, targetW, targetH, UINT(SWP_NOZORDER | SWP_NOMOVE))
+            }
+            performZStackLayout(container: hwnd!, info: info)
+            win32NotifyChildSizeChanged(hwnd!)
+        }
+        return 0
 
     case UINT(WM_NCDESTROY):
         if dwRefData != 0 {

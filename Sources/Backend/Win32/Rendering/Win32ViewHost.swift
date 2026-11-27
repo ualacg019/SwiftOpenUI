@@ -99,6 +99,7 @@ public class Win32ViewHost: AnyViewHost, DependencyTrackingHost {
 
     /// Current child HWND inside the container.
     private var currentChild: HWND?
+    var hasChild: Bool { currentChild != nil }
 
     /// Descriptor/executor bookkeeping for narrow text/color host integration.
     private(set) var retainedDescriptorRoot: Win32RetainedDescriptorNode?
@@ -463,6 +464,26 @@ public class Win32ViewHost: AnyViewHost, DependencyTrackingHost {
         SetWindowPos(child, nil, 0, 0, rect.right - rect.left, rect.bottom - rect.top, UINT(SWP_NOZORDER))
     }
 
+    func handleChildSizeChanged() {
+        guard let child = currentChild else { return }
+        syncExpandFlagsFromChild()
+        var childRect = RECT()
+        GetWindowRect(child, &childRect)
+        let childW = childRect.right - childRect.left
+        let childH = childRect.bottom - childRect.top
+        var containerRect = RECT()
+        GetWindowRect(container, &containerRect)
+        let curW = containerRect.right - containerRect.left
+        let curH = containerRect.bottom - containerRect.top
+        let targetW = max(curW, childW)
+        let targetH = max(curH, childH)
+        if targetW != curW || targetH != curH {
+            SetWindowPos(container, nil, 0, 0, targetW, targetH, UINT(SWP_NOZORDER | SWP_NOMOVE))
+        }
+        layoutChild()
+        win32NotifyChildSizeChanged(container)
+    }
+
     private func captureRetainedDescriptorState() {
         guard let child = currentChild else {
             retainedDescriptorRoot = nil
@@ -603,6 +624,12 @@ private let containerWndProc: WNDPROC = { (hwnd, uMsg, wParam, lParam) in
         let hdc = HDC(bitPattern: Int(bitPattern: UInt(wParam)))
         SetBkMode(hdc, TRANSPARENT)
         return LRESULT(Int(bitPattern: GetSysColorBrush(COLOR_WINDOW)))
+
+    case WM_SWIFTUI_CHILD_SIZE_CHANGED:
+        if let host = findContainingViewHost(from: hwnd), host.hasChild {
+            host.handleChildSizeChanged()
+        }
+        return 0
 
     case UINT(WM_NCDESTROY):
         let userData = win32_GetWindowLongPtrW(hwnd!, GWLP_USERDATA)

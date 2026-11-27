@@ -71,6 +71,23 @@ public func winRenderAnyView(_ view: any View, in context: RenderContext) -> HWN
 // MARK: - Stateful view rendering
 
 private func winRenderStatefulView<V: View>(_ view: V, in context: RenderContext) -> HWND? {
+    // Positional state reconciliation: when the owning host rebuilds, this
+    // view is constructed again with brand-new storages. Restore the previous
+    // pass's values (matched by render position + type) so nested state
+    // survives parent rebuilds, as in SwiftUI and the GTK4 backend.
+    if let parentHost = Win32ViewHost.current {
+        let key = parentHost.nextChildKey(type: String(describing: V.self))
+        let providers = Mirror(reflecting: view).children.compactMap {
+            $0.value as? AnyStateStorageProvider
+        }
+        if let cached = parentHost.childStateCache[key], cached.count == providers.count {
+            for (provider, old) in zip(providers, cached) {
+                provider.anyStorage.restoreValue(from: old)
+            }
+        }
+        parentHost.childStateCache[key] = providers.map { $0.anyStorage }
+    }
+
     let host = Win32ViewHost(
         context: context,
         buildBody: { ctx in
@@ -94,21 +111,41 @@ private func winRenderStatefulView<V: View>(_ view: V, in context: RenderContext
     // through common-control/window-proc paths before `winRenderStatefulView`
     // returns, so relying on an outer modifier's temporary TLS push is not
     // stable enough for the host's full initial lifecycle.
-    let previousEnv = getCurrentEnvironment()
-    host.installEffectiveEnvironment()
+    //
+    // Inside a host's tracked body pass the body is built after that pass
+    // (see win32DeferStatefulBuild), with this point's navigation context.
+    let navigationContext = getCurrentNavigationContext()
+    var wasDeferred = false
+    let build = {
+        let previousNavigation = getCurrentNavigationContext()
+        setCurrentNavigationContext(navigationContext)
+        let previousEnv = getCurrentEnvironment()
+        host.installEffectiveEnvironment()
 
-    // Phase 6+7: track which storages are read during initial body evaluation
-    beginDependencyTracking()
-    let childHwnd = host.buildBodyWithTracking(containerContext)
-    if let tracking = endDependencyTracking() {
-        host.lastReadSet = tracking.readSet
-        host.lastInputSnapshot = tracking.snapshots
-    }
+        // Phase 6+7: track which storages are read during initial body evaluation
+        beginDependencyTracking()
+        let childHwnd = host.buildBodyWithTracking(containerContext)
+        if let tracking = endDependencyTracking() {
+            host.lastReadSet = tracking.readSet
+            host.lastInputSnapshot = tracking.snapshots
+        }
 
-    if let child = childHwnd {
-        host.addChild(child)
+        if let child = childHwnd {
+            host.addChild(child)
+            if wasDeferred {
+                win32NotifyChildSizeChanged(host.container)
+            }
+        }
+        setCurrentEnvironment(previousEnv)
+        setCurrentNavigationContext(previousNavigation)
     }
-    setCurrentEnvironment(previousEnv)
+    if win32DeferStatefulBuild({
+        wasDeferred = true
+        build()
+    }) {
+        return host.container
+    }
+    build()
     return host.container
 }
 
@@ -1234,8 +1271,10 @@ class FlatButtonState {
 
     func ensureTarget(width: UInt32, height: UInt32) {
         guard width > 0, height > 0 else { return }
-        if let old = renderTarget { D2DRenderer.shared.releaseRenderTarget(old) }
-        if let old = brush { D2DRenderer.shared.releaseBrush(old) }
+        if let rt = renderTarget {
+            D2DRenderer.shared.resize(rt, width: width, height: height)
+            return
+        }
         renderTarget = D2DRenderer.shared.createRenderTarget(for: hwnd, width: width, height: height)
         if let rt = renderTarget { brush = D2DRenderer.shared.createBrush(rt, r: 0, g: 0, b: 0) }
     }
@@ -1571,8 +1610,21 @@ private func makeMouseTransparent(_ hwnd: HWND) {
 
     var child = GetWindow(hwnd, UINT(GW_CHILD))
     while let c = child {
-        makeMouseTransparent(c)
+        // A control inside the label — a row's checkmark button inside a
+        // NavigationLink, say — keeps its own clicks, as in SwiftUI; the
+        // rest of the label passes clicks through to this container.
+        if !isInteractiveLabelControl(c) {
+            makeMouseTransparent(c)
+        }
         child = GetWindow(c, UINT(GW_HWNDNEXT))
+    }
+}
+
+/// Controls that handle their own mouse input when nested in a button label.
+private func isInteractiveLabelControl(_ hwnd: HWND) -> Bool {
+    switch win32ClassName(hwnd) {
+    case "SwiftUICustomButton", "Button", "Edit": return true
+    default: return false
     }
 }
 
@@ -1580,6 +1632,9 @@ private class CustomButtonInfo {
     let action: () -> Void
     let child: HWND?
     var pressed: Bool = false
+    /// Set while a WM_CONTEXTMENU is being offered to the label, so the copy
+    /// the label passes back up isn't offered again.
+    var offeringContextMenu = false
     init(action: @escaping () -> Void, child: HWND?) {
         self.action = action
         self.child = child
@@ -1681,6 +1736,20 @@ private let customButtonProc: SUBCLASSPROC = { (hwnd, uMsg, wParam, lParam, uIdS
                     info.action()
                 }
             }
+            return 0
+        }
+        return DefSubclassProc(hwnd, uMsg, wParam, lParam)
+
+    // --- Context menu of the label ---
+    // The label is mouse-transparent, so right-clicks land on the button and
+    // WM_CONTEXTMENU would only travel up, never reaching a .contextMenu on
+    // the label (e.g. a NavigationLink row). Offer it to the label first; if
+    // the label has no menu its copy comes back here and goes up as usual.
+    case UINT(WM_CONTEXTMENU):
+        if !info.offeringContextMenu, let child = info.child {
+            info.offeringContextMenu = true
+            _ = SendMessageW(child, uMsg, wParam, lParam)
+            info.offeringContextMenu = false
             return 0
         }
         return DefSubclassProc(hwnd, uMsg, wParam, lParam)
@@ -2286,6 +2355,32 @@ let paddingLayoutProc: SUBCLASSPROC = { (hwnd, uMsg, wParam, lParam, uIdSubclass
         }
         return 0
 
+    case WM_SWIFTUI_CHILD_SIZE_CHANGED:
+        if dwRefData != 0 {
+            let info = Unmanaged<PaddingLayoutInfo>.fromOpaque(
+                UnsafeMutableRawPointer(bitPattern: UInt(dwRefData))!
+            ).takeUnretainedValue()
+            var childRect = RECT()
+            GetWindowRect(info.child, &childRect)
+            let childW = childRect.right - childRect.left
+            let childH = childRect.bottom - childRect.top
+            let naturalW = childW + info.leading + info.trailing
+            let naturalH = childH + info.top + info.bottom
+            var cur = RECT()
+            GetWindowRect(hwnd!, &cur)
+            let curW = cur.right - cur.left
+            let curH = cur.bottom - cur.top
+            let targetW = max(curW, naturalW)
+            let targetH = max(curH, naturalH)
+            if targetW != curW || targetH != curH {
+                SetWindowPos(hwnd!, nil, 0, 0, targetW, targetH, UINT(SWP_NOZORDER | SWP_NOMOVE))
+            }
+            propagateExpandFlags(from: info.child, to: hwnd!)
+            performPaddingLayout(container: hwnd!, info: info)
+            win32NotifyChildSizeChanged(hwnd!)
+        }
+        return 0
+
     case UINT(WM_NCDESTROY):
         if dwRefData != 0 {
             Unmanaged<PaddingLayoutInfo>.fromOpaque(
@@ -2407,9 +2502,9 @@ extension FrameView: WinRenderable {
 class FrameLayoutInfo {
     let child: HWND
     let alignment: Alignment
-    let childNaturalSize: ViewSize
-    let expandsToFillWidth: Bool
-    let expandsToFillHeight: Bool
+    var childNaturalSize: ViewSize
+    var expandsToFillWidth: Bool
+    var expandsToFillHeight: Bool
     // Original constraints for resize-time recomputation
     let frameWidth: Double?
     let frameHeight: Double?
@@ -2519,6 +2614,51 @@ let frameLayoutProc: SUBCLASSPROC = { (hwnd, uMsg, wParam, lParam, uIdSubclass, 
         }
         if let root = findRootWindow(from: hwnd!) as HWND? {
             return SendMessageW(root, uMsg, wParam, lParam)
+        }
+        return 0
+
+    case WM_SWIFTUI_CHILD_SIZE_CHANGED:
+        if dwRefData != 0 {
+            let info = Unmanaged<FrameLayoutInfo>.fromOpaque(
+                UnsafeMutableRawPointer(bitPattern: UInt(dwRefData))!
+            ).takeUnretainedValue()
+            var childRect = RECT()
+            GetWindowRect(info.child, &childRect)
+            info.childNaturalSize = ViewSize(
+                width: Double(childRect.right - childRect.left),
+                height: Double(childRect.bottom - childRect.top)
+            )
+            info.expandsToFillWidth = GetPropW(info.child, colorExpandPropName) != nil || shouldExpandWidth(info.child)
+            info.expandsToFillHeight = GetPropW(info.child, colorExpandPropName) != nil || shouldExpandHeight(info.child)
+
+            let result = computeFrameLayout(
+                childNaturalSize: info.childNaturalSize,
+                width: info.frameWidth, height: info.frameHeight,
+                minWidth: info.frameMinWidth, minHeight: info.frameMinHeight,
+                maxWidth: info.frameMaxWidth, maxHeight: info.frameMaxHeight,
+                alignment: info.alignment,
+                expandsToFillWidth: info.expandsToFillWidth,
+                expandsToFillHeight: info.expandsToFillHeight
+            )
+            let naturalW = Int32(ceil(result.containerSize.width))
+            let naturalH = Int32(ceil(result.containerSize.height))
+            var cur = RECT()
+            GetWindowRect(hwnd!, &cur)
+            let curW = cur.right - cur.left
+            let curH = cur.bottom - cur.top
+            let targetW = max(curW, naturalW)
+            let targetH = max(curH, naturalH)
+            if targetW != curW || targetH != curH {
+                SetWindowPos(hwnd!, nil, 0, 0, targetW, targetH, UINT(SWP_NOZORDER | SWP_NOMOVE))
+            }
+            if info.frameMaxWidth == .infinity || (info.expandsToFillWidth && info.frameWidth == nil && info.frameMaxWidth == nil) {
+                markExpandWidth(hwnd!)
+            }
+            if info.frameMaxHeight == .infinity || (info.expandsToFillHeight && info.frameHeight == nil && info.frameMaxHeight == nil) {
+                markExpandHeight(hwnd!)
+            }
+            layoutFrameChild(in: hwnd!, info: info)
+            win32NotifyChildSizeChanged(hwnd!)
         }
         return 0
 
@@ -2730,6 +2870,28 @@ let foregroundColorProc: SUBCLASSPROC = { (hwnd, uMsg, wParam, lParam, uIdSubcla
         if let root = findRootWindow(from: hwnd!) as HWND? {
             return SendMessageW(root, uMsg, wParam, lParam)
         }
+        return 0
+
+    case WM_SWIFTUI_CHILD_SIZE_CHANGED:
+        var childRect = RECT()
+        GetWindowRect(info.child, &childRect)
+        let childW = childRect.right - childRect.left
+        let childH = childRect.bottom - childRect.top
+        var cur = RECT()
+        GetWindowRect(hwnd!, &cur)
+        let curW = cur.right - cur.left
+        let curH = cur.bottom - cur.top
+        let targetW = max(curW, childW)
+        let targetH = max(curH, childH)
+        if targetW != curW || targetH != curH {
+            SetWindowPos(hwnd!, nil, 0, 0, targetW, targetH, UINT(SWP_NOZORDER | SWP_NOMOVE))
+        }
+        propagateExpandFlags(from: info.child, to: hwnd!)
+        var clientRect = RECT()
+        GetClientRect(hwnd, &clientRect)
+        SetWindowPos(info.child, nil, 0, 0,
+                     clientRect.right - clientRect.left, clientRect.bottom - clientRect.top, UINT(SWP_NOZORDER))
+        win32NotifyChildSizeChanged(hwnd!)
         return 0
 
     case UINT(WM_NCDESTROY):
@@ -2953,6 +3115,28 @@ let backgroundProc: SUBCLASSPROC = { (hwnd, uMsg, wParam, lParam, uIdSubclass, d
         }
         return 0
 
+    case WM_SWIFTUI_CHILD_SIZE_CHANGED:
+        var childRect = RECT()
+        GetWindowRect(info.child, &childRect)
+        let childW = childRect.right - childRect.left
+        let childH = childRect.bottom - childRect.top
+        var cur = RECT()
+        GetWindowRect(hwnd!, &cur)
+        let curW = cur.right - cur.left
+        let curH = cur.bottom - cur.top
+        let targetW = max(curW, childW)
+        let targetH = max(curH, childH)
+        if targetW != curW || targetH != curH {
+            SetWindowPos(hwnd!, nil, 0, 0, targetW, targetH, UINT(SWP_NOZORDER | SWP_NOMOVE))
+        }
+        propagateExpandFlags(from: info.child, to: hwnd!)
+        var clientRect = RECT()
+        GetClientRect(hwnd, &clientRect)
+        SetWindowPos(info.child, nil, 0, 0,
+                     clientRect.right - clientRect.left, clientRect.bottom - clientRect.top, UINT(SWP_NOZORDER))
+        win32NotifyChildSizeChanged(hwnd!)
+        return 0
+
     case UINT(WM_NCDESTROY):
         Unmanaged<BackgroundInfo>.fromOpaque(
             UnsafeMutableRawPointer(bitPattern: UInt(dwRefData))!
@@ -3057,6 +3241,35 @@ let backgroundShapeProc: SUBCLASSPROC = { (hwnd, uMsg, wParam, lParam, uIdSubcla
         if let root = findRootWindow(from: hwnd!) as HWND? {
             return SendMessageW(root, uMsg, wParam, lParam)
         }
+        return 0
+
+    case WM_SWIFTUI_CHILD_SIZE_CHANGED:
+        var childRect = RECT()
+        GetWindowRect(info.content, &childRect)
+        let childW = childRect.right - childRect.left
+        let childH = childRect.bottom - childRect.top
+        var cur = RECT()
+        GetWindowRect(hwnd!, &cur)
+        let curW = cur.right - cur.left
+        let curH = cur.bottom - cur.top
+        let targetW = max(curW, childW)
+        let targetH = max(curH, childH)
+        if targetW != curW || targetH != curH {
+            SetWindowPos(hwnd!, nil, 0, 0, targetW, targetH, UINT(SWP_NOZORDER | SWP_NOMOVE))
+        }
+        propagateExpandFlags(from: info.content, to: hwnd!)
+        var rect = RECT()
+        GetClientRect(hwnd, &rect)
+        let w = rect.right - rect.left
+        let h = rect.bottom - rect.top
+        if let bg = info.background {
+            placeBackgroundLayer(bg, in: (w, h), natural: info.backgroundNatural,
+                                 expandsWidth: info.backgroundExpandsWidth,
+                                 expandsHeight: info.backgroundExpandsHeight,
+                                 alignment: info.alignment)
+        }
+        SetWindowPos(info.content, nil, 0, 0, w, h, UINT(SWP_NOZORDER))
+        win32NotifyChildSizeChanged(hwnd!)
         return 0
 
     case UINT(WM_NCDESTROY):
@@ -3954,7 +4167,7 @@ extension ScrollView: WinRenderable {
 
 private class ScrollViewState {
     let child: HWND
-    let contentHeight: Int32
+    var contentHeight: Int32
     var scrollY: Int32 = 0
 
     init(child: HWND, contentHeight: Int32) {
@@ -4077,6 +4290,9 @@ private let scrollViewWndProc: WNDPROC = { (hwnd, uMsg, wParam, lParam) in
         }
         return 0
 
+    case UINT(WM_ERASEBKGND):
+        return eraseWithInheritedBackground(hwnd: hwnd!, wParam: wParam)
+
     case UINT(WM_CTLCOLORSTATIC), UINT(WM_CTLCOLORBTN):
         if let parent = GetParent(hwnd!) {
             return SendMessageW(parent, uMsg, wParam, lParam)
@@ -4084,6 +4300,35 @@ private let scrollViewWndProc: WNDPROC = { (hwnd, uMsg, wParam, lParam) in
         let hdc = HDC(bitPattern: Int(bitPattern: UInt(wParam)))
         SetBkMode(hdc, TRANSPARENT)
         return LRESULT(Int(bitPattern: GetSysColorBrush(COLOR_WINDOW)))
+
+    case WM_SWIFTUI_CHILD_SIZE_CHANGED:
+        let userData = win32_GetWindowLongPtrW(hwnd!, GWLP_USERDATA)
+        if userData != 0 {
+            let state = Unmanaged<ScrollViewState>.fromOpaque(
+                UnsafeMutableRawPointer(bitPattern: Int(userData))!
+            ).takeUnretainedValue()
+            var childRect = RECT()
+            GetWindowRect(state.child, &childRect)
+            let contentW = childRect.right - childRect.left
+            let contentH = childRect.bottom - childRect.top
+            state.contentHeight = contentH
+
+            var rect = RECT()
+            GetClientRect(hwnd, &rect)
+            var visibleW = rect.right - rect.left
+            let visibleH = rect.bottom - rect.top
+            if visibleW == 0 && visibleH == 0 {
+                let displayH = min(contentH, px(200, for: hwnd!))
+                SetWindowPos(hwnd!, nil, 0, 0, contentW, displayH, UINT(SWP_NOZORDER | SWP_NOMOVE))
+                GetClientRect(hwnd, &rect)
+                visibleW = rect.right - rect.left
+            }
+            let childW = max(visibleW, contentW)
+            SetWindowPos(state.child, nil, 0, -state.scrollY, childW, state.contentHeight, UINT(SWP_NOZORDER))
+            updateScrollRange(hwnd!, state: state)
+            win32NotifyChildSizeChanged(hwnd!)
+        }
+        return 0
 
     case UINT(WM_NCDESTROY):
         let userData = win32_GetWindowLongPtrW(hwnd!, GWLP_USERDATA)
@@ -4618,12 +4863,15 @@ extension ProgressView: WinRenderable {
 
 extension Label: WinRenderable {
     public func winCreateWidget(in context: RenderContext) -> HWND? {
-        let displayText: String
+        // With an icon: the icon (SF Symbols -> Material glyph, as in
+        // Image(systemName:)) next to the title, like SwiftUI's Label.
         if let icon = systemImage {
-            displayText = "[\(icon)] \(title)"
-        } else {
-            displayText = title
+            return winRenderView(HStack(spacing: 6) {
+                Image(systemName: icon)
+                Text(title)
+            }, in: context)
         }
+        let displayText = title
         let measured = measureText(displayText, hwnd: context.parent)
         return displayText.withCString(encodedAs: UTF16.self) { wstr in
             win32_CreateChildWindow(
@@ -5230,8 +5478,12 @@ extension ConfirmationDialogView: WinRenderable {
 
 extension Form: WinRenderable {
     public func winCreateWidget(in context: RenderContext) -> HWND? {
-        // Form renders as a VStack with padding — visual grouping for controls
-        let formView = VStack(alignment: .leading, spacing: 8) { content }.padding()
+        // Form renders as a VStack with padding — visual grouping for controls.
+        // Like SwiftUI's Form it takes the available width, so a Form next to
+        // a Spacer in an HStack isn't squeezed to its content.
+        let formView = VStack(alignment: .leading, spacing: 8) { content }
+            .padding()
+            .frame(maxWidth: .infinity, alignment: .topLeading)
         return winRenderView(formView, in: context)
     }
 }
@@ -5368,8 +5620,10 @@ private class SegmentedControlState {
 
     func ensureTarget(width: UInt32, height: UInt32) {
         guard width > 0, height > 0 else { return }
-        if let old = renderTarget { D2DRenderer.shared.releaseRenderTarget(old) }
-        if let old = brush { D2DRenderer.shared.releaseBrush(old) }
+        if let rt = renderTarget {
+            D2DRenderer.shared.resize(rt, width: width, height: height)
+            return
+        }
         renderTarget = D2DRenderer.shared.createRenderTarget(for: hwnd, width: width, height: height)
         if let rt = renderTarget { brush = D2DRenderer.shared.createBrush(rt, r: 0, g: 0, b: 0) }
     }
@@ -6394,6 +6648,22 @@ extension DatePicker: WinRenderable {
             let infoPtr = Unmanaged.passRetained(info).toOpaque()
             SetWindowSubclass(container, datePickerNotifyProc, 43, DWORD_PTR(UInt(bitPattern: infoPtr)))
         }
+
+        // Hour and minute under the date control (displayedComponents
+        // .hourAndMinute), so the picker doesn't get wider than a form column.
+        if let timeControls,
+           let timeHwnd = winRenderView(timeControls, in: RenderContext(parent: container, hInstance: context.hInstance)) {
+            var r = RECT()
+            GetWindowRect(timeHwnd, &r)
+            let timeW = r.right - r.left, timeH = r.bottom - r.top
+            // From the left edge (under the label): the combo boxes are wide.
+            let timeX: Int32 = 0
+            let timeY = px(24, for: context.parent) + px(4, for: context.parent)
+            SetWindowPos(timeHwnd, nil, timeX, timeY, timeW, timeH, UINT(SWP_NOZORDER))
+            SetWindowPos(container, nil, 0, 0,
+                         max(px(250, for: context.parent), timeX + timeW), timeY + timeH,
+                         UINT(SWP_NOZORDER | SWP_NOMOVE))
+        }
         return container
     }
 }
@@ -7042,6 +7312,16 @@ private let splitViewLayoutProc: SUBCLASSPROC = { (hwnd, uMsg, wParam, lParam, u
             return SendMessageW(parentHwnd, uMsg, wParam, lParam)
         }
         return DefSubclassProc(hwnd, uMsg, wParam, lParam)
+
+    case WM_SWIFTUI_CHILD_SIZE_CHANGED:
+        let columnHwnds = [state.sidebarHwnd, state.contentHwnd, state.detailHwnd].compactMap { $0 }
+        if columnHwnds.contains(where: { shouldExpandWidth($0) }) { markExpandWidth(hwnd!) }
+        if columnHwnds.contains(where: { shouldExpandHeight($0) }) { markExpandHeight(hwnd!) }
+        var rect = RECT()
+        GetClientRect(hwnd, &rect)
+        state.layout(containerW: rect.right, containerH: rect.bottom)
+        win32NotifyChildSizeChanged(hwnd!)
+        return 0
 
     case UINT(WM_NCDESTROY):
         Unmanaged<SplitViewState>.fromOpaque(
@@ -8843,13 +9123,39 @@ extension ContextMenuView: WinRenderable {
         let statePtr = Unmanaged.passRetained(state).toOpaque()
         SetWindowSubclass(hwnd, contextMenuProc, contextMenuSubclassID,
                           DWORD_PTR(UInt(bitPattern: statePtr)))
+        win32Trace("context menu installed on \(win32ClassName(hwnd)) with \(menuElements.count) elements")
         return hwnd
     }
 }
 
+/// Appends a line to the file named by SWIFTOPENUI_TRACE_FILE, if set
+/// (diagnostics for UI behavior that is hard to observe, e.g. in CI).
+func win32Trace(_ message: String) {
+    guard let path = ProcessInfo.processInfo.environment["SWIFTOPENUI_TRACE_FILE"],
+          let data = (message + "\n").data(using: .utf8) else { return }
+    if let handle = FileHandle(forWritingAtPath: path) {
+        handle.seekToEndOfFile()
+        handle.write(data)
+        handle.closeFile()
+    } else {
+        FileManager.default.createFile(atPath: path, contents: data)
+    }
+}
+
+/// The window class name of a window, for diagnostics.
+func win32ClassName(_ hwnd: HWND) -> String {
+    var buffer = [WCHAR](repeating: 0, count: 256)
+    let length = GetClassNameW(hwnd, &buffer, 256)
+    return String(decoding: buffer.prefix(Int(length)), as: UTF16.self)
+}
+
 private let contextMenuProc: SUBCLASSPROC = { (hwnd, uMsg, wParam, lParam, uIdSubclass, dwRefData) in
     switch uMsg {
-    case UINT(WM_RBUTTONUP):
+    // WM_CONTEXTMENU, not WM_RBUTTONUP: mouse messages go to the innermost
+    // child under the cursor (e.g. a row's text), while a child that shows no
+    // menu passes WM_CONTEXTMENU up to its parent, so right-clicking anywhere
+    // in the view reaches this handler. It also covers Shift+F10 / menu key.
+    case UINT(WM_CONTEXTMENU):
         let statePtr = UnsafeMutableRawPointer(bitPattern: UInt(dwRefData))!
         let state = Unmanaged<ContextMenuState>.fromOpaque(statePtr).takeUnretainedValue()
 
@@ -8860,13 +9166,22 @@ private let contextMenuProc: SUBCLASSPROC = { (hwnd, uMsg, wParam, lParam, uIdSu
 
         var pt = POINT()
         GetCursorPos(&pt)
-        // TrackPopupMenu dispatches WM_COMMAND synchronously to hwnd
-        // when an item is selected. Store actions on state so WM_COMMAND
-        // handler can look them up.
-        state.pendingActions = actions
-        _ = TrackPopupMenu(hmenu, 0, pt.x, pt.y, 0, hwnd, nil)
-        state.pendingActions = nil
+        // A popup menu needs its owner's window in the foreground to show and
+        // dismiss properly.
+        if let root = GetAncestor(hwnd, UINT(GA_ROOT)) {
+            SetForegroundWindow(root)
+        }
+        // TPM_RETURNCMD: the chosen item comes back as the return value. Without
+        // it the item's WM_COMMAND is posted and arrives after this returns,
+        // when the actions are gone, so choosing an item did nothing.
+        // (Through the C shim: Swift imports TrackPopupMenu's result as Bool.)
+        let flags = UINT(TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON)
+        let selected = win32_TrackPopupMenuReturnCmd(hmenu, flags, pt.x, pt.y, hwnd)
+        win32Trace("context menu at (\(pt.x),\(pt.y)) items=\(actions.count) selected=\(selected) lastError=\(GetLastError())")
         DestroyMenu(hmenu)
+        if selected != 0, let action = actions[UINT(selected)] {
+            action()
+        }
         return 0
 
     case UINT(WM_COMMAND):
@@ -9189,6 +9504,7 @@ private class DragGestureHandler {
     var dragging: Bool = false  // distance threshold exceeded, drag is active
     var startX: Double = 0
     var startY: Double = 0
+    var interactiveHosts: [Win32ViewHost] = []
 
     init(onChanged: ((DragGestureValue) -> Void)?, onEnded: ((DragGestureValue) -> Void)?,
          minimumDistance: Double, rootHwnd: HWND) {
@@ -9196,6 +9512,27 @@ private class DragGestureHandler {
         self.onEnded = onEnded
         self.minimumDistance = minimumDistance
         self.rootHwnd = rootHwnd
+    }
+
+    /// Defer state-driven rebuilds on all ancestor view hosts while the pointer
+    /// is down: a rebuild destroys the gesture's HWND and drops SetCapture.
+    func beginInteractiveIfNeeded() {
+        guard interactiveHosts.isEmpty else { return }
+        var current: HWND? = rootHwnd
+        while let host = findContainingViewHost(from: current) {
+            host.beginInteractiveUpdate()
+            interactiveHosts.append(host)
+            current = GetParent(host.container)
+        }
+    }
+
+    func endInteractiveIfNeeded() {
+        guard !interactiveHosts.isEmpty else { return }
+        let hosts = interactiveHosts
+        interactiveHosts.removeAll()
+        for host in hosts.reversed() {
+            host.endInteractiveUpdate()
+        }
     }
 }
 
@@ -9218,7 +9555,19 @@ private let dragGestureProc: SUBCLASSPROC = { (hwnd, uMsg, wParam, lParam, uIdSu
         handler.startY = Double(pt.y)
         handler.tracking = true
         handler.dragging = false
+        handler.beginInteractiveIfNeeded()
         SetCapture(handler.rootHwnd)
+        if handler.minimumDistance <= 0 {
+            handler.dragging = true
+            let scale = dpiScaleFactor(for: handler.rootHwnd)
+            let value = DragGestureValue(
+                startLocation: (x: handler.startX / scale, y: handler.startY / scale),
+                location: (x: handler.startX / scale, y: handler.startY / scale),
+                translation: (width: 0, height: 0)
+            )
+            handler.onChanged?(value)
+            RedrawWindow(handler.rootHwnd, nil, nil, UINT(RDW_INVALIDATE | RDW_ALLCHILDREN))
+        }
         return DefSubclassProc(hwnd, uMsg, wParam, lParam)
 
     case UINT(WM_MOUSEMOVE):
@@ -9255,7 +9604,6 @@ private let dragGestureProc: SUBCLASSPROC = { (hwnd, uMsg, wParam, lParam, uIdSu
             let wasDragging = handler.dragging
             handler.tracking = false
             handler.dragging = false
-            ReleaseCapture()
             if wasDragging {
                 var pt = POINT(x: LONG(win32_GET_X_LPARAM(lParam)), y: LONG(win32_GET_Y_LPARAM(lParam)))
                 if hwnd != handler.rootHwnd {
@@ -9273,15 +9621,21 @@ private let dragGestureProc: SUBCLASSPROC = { (hwnd, uMsg, wParam, lParam, uIdSu
                 // Invalidate so Canvas repaints with the committed stroke
                 RedrawWindow(hwnd, nil, nil, UINT(RDW_INVALIDATE | RDW_ALLCHILDREN))
             }
+            ReleaseCapture()
+            handler.endInteractiveIfNeeded()
         }
         return DefSubclassProc(hwnd, uMsg, wParam, lParam)
 
     case UINT(WM_CAPTURECHANGED):
-        handler.tracking = false
-        handler.dragging = false
+        if handler.tracking {
+            handler.tracking = false
+            handler.dragging = false
+            handler.endInteractiveIfNeeded()
+        }
         return DefSubclassProc(hwnd, uMsg, wParam, lParam)
 
     case UINT(WM_NCDESTROY):
+        handler.endInteractiveIfNeeded()
         Unmanaged<DragGestureHandler>.fromOpaque(
             UnsafeMutableRawPointer(bitPattern: UInt(dwRefData))!
         ).release()
@@ -10270,33 +10624,11 @@ extension DrawingContext {
 
 extension ViewList: WinRenderable {
     public func winCreateWidget(in context: RenderContext) -> HWND? {
-        registerStackClassIfNeeded(hInstance: context.hInstance)
-
-        let container = CreateWindowExW(
-            0, stackContainerClassName, nil,
-            DWORD(WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN),
-            0, 0, 0, 0,
-            context.parent, nil, context.hInstance, nil
-        )!
-
-        let childContext = RenderContext(parent: container, hInstance: context.hInstance)
-        var y: Int32 = 0
-        var maxW: Int32 = 0
-
-        for child in children {
-            if let hwnd = winRenderAnyView(child, in: childContext) {
-                var r = RECT()
-                GetWindowRect(hwnd, &r)
-                let w = r.right - r.left
-                let h = r.bottom - r.top
-                SetWindowPos(hwnd, nil, 0, y, w, h, UINT(SWP_NOZORDER))
-                y += h
-                maxW = max(maxW, w)
-            }
-        }
-
-        SetWindowPos(container, nil, 0, 0, maxW, y, UINT(SWP_NOZORDER | SWP_NOMOVE))
-        return container
+        // Several views at the root of a body (e.g. `HStack { ... }` followed
+        // by `Spacer()`) are laid out like SwiftUI's implicit VStack: a real
+        // stack, so flexible children (spacers, `.frame(maxWidth: .infinity)`)
+        // share the space instead of keeping their natural size.
+        winRenderView(VStack { self }, in: context)
     }
 }
 

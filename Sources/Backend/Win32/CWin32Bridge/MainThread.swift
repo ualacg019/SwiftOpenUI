@@ -7,6 +7,9 @@ public let WM_SWIFTUI_REBUILD: UINT = UINT(WM_APP) + 1
 /// Custom message ID for running arbitrary closures on the UI thread.
 public let WM_SWIFTUI_INVOKE: UINT = UINT(WM_APP) + 2
 
+/// Custom message ID notifying parent containers that a deferred child host updated its natural size.
+public let WM_SWIFTUI_CHILD_SIZE_CHANGED: UINT = UINT(WM_APP) + 3
+
 /// Post a closure to run on the UI thread via the message loop.
 public func runOnMainThread(hwnd: HWND, _ work: @escaping () -> Void) {
     let box = Unmanaged.passRetained(ClosureBox(work)).toOpaque()

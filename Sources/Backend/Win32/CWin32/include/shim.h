@@ -198,3 +198,9 @@ static inline HWND win32_CreateChildWindow(
         x, y, width, height,
         parent, id, hInstance, NULL);
 }
+
+// --- Event loop wait helper ---
+
+static inline DWORD win32_MsgWaitForInput(DWORD timeoutMs) {
+    return MsgWaitForMultipleObjectsEx(0, NULL, timeoutMs, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+}

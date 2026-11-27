@@ -336,6 +336,20 @@ private let navContainerWndProc: WNDPROC = { (hwnd, uMsg, wParam, lParam) in
         SetBkMode(hdc, TRANSPARENT)
         return LRESULT(Int(bitPattern: GetSysColorBrush(COLOR_WINDOW)))
 
+    case WM_SWIFTUI_CHILD_SIZE_CHANGED:
+        let userData = win32_GetWindowLongPtrW(hwnd!, GWLP_USERDATA)
+        if userData != 0 {
+            let ctx = Unmanaged<Win32NavigationContext>.fromOpaque(
+                UnsafeMutableRawPointer(bitPattern: Int(userData))!
+            ).takeUnretainedValue()
+            if let root = ctx.entries.first?.hwnd {
+                propagateExpandFlags(from: root, to: hwnd!)
+            }
+            layoutNavContainer(ctx)
+            win32NotifyChildSizeChanged(hwnd!)
+        }
+        return 0
+
     case UINT(WM_NCDESTROY):
         let userData = win32_GetWindowLongPtrW(hwnd!, GWLP_USERDATA)
         if userData != 0 {

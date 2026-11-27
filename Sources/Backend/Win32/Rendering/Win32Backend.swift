@@ -814,12 +814,26 @@ public struct Win32Backend: RenderBackend {
                 DispatchMessageW(&msg)
             }
 
-            // Pump Foundation sources (Timer, etc.) on the main RunLoop.
-            // Use RunLoop.main explicitly and pump both .default and .common modes
-            // so Timer.scheduledTimer callbacks fire reliably on Windows.
-            let limit = Date(timeIntervalSinceNow: 0.005)
-            _ = RunLoop.main.run(mode: .default, before: limit)
-            _ = RunLoop.main.run(mode: .common, before: limit)
+            // Pump ready Foundation sources (Timer, MainActor/libdispatch main queue)
+            // without blocking Win32 message dispatch.
+            let now = Date.distantPast
+            _ = RunLoop.main.run(mode: .default, before: now)
+            _ = RunLoop.main.run(mode: .common, before: now)
+
+            // If Foundation work posted Win32 messages (e.g. WM_SWIFTUI_REBUILD),
+            // process them immediately instead of sleeping.
+            if PeekMessageW(&msg, nil, 0, 0, UINT(PM_NOREMOVE)) {
+                continue
+            }
+
+            // Sleep until the next Win32 message arrives OR the next Foundation
+            // timer / 16ms tick, avoiding 100% CPU busy-waiting.
+            var waitMs: DWORD = 16
+            if let nextDate = RunLoop.main.limitDate(forMode: .default) {
+                let deltaMs = min(16.0, max(1.0, (nextDate.timeIntervalSinceNow * 1000.0).rounded(.up)))
+                waitMs = DWORD(deltaMs)
+            }
+            _ = win32_MsgWaitForInput(waitMs)
         }
     }
 }
