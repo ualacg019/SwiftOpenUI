@@ -203,6 +203,14 @@ HRESULT dwrite_CreateTextFormat(
     int italic,    // 0 = normal, 1 = italic
     DWriteTextFormat *ppFormat
 );
+HRESULT dwrite_CreateTextFormatWithWeight(
+    DWriteFactory factory,
+    const WCHAR *fontFamily,
+    float fontSize,
+    int weight,    // DWRITE_FONT_WEIGHT numeric value (100..900, e.g. 400 normal, 700 bold)
+    int italic,    // 0 = normal, 1 = italic
+    DWriteTextFormat *ppFormat
+);
 void dwrite_TextFormat_Release(DWriteTextFormat format);
 
 // Set text alignment on a format
@@ -228,6 +236,20 @@ HRESULT dwrite_TextLayout_GetMetrics(
     DWriteTextLayout layout,
     float *outWidth,
     float *outHeight
+);
+
+// Measure text with wrapping and optional line limit.
+HRESULT dwrite_MeasureTextStyled(
+    DWriteFactory factory,
+    const WCHAR *text,
+    UINT32 textLength,
+    DWriteTextFormat format,
+    float maxWidth,
+    float maxHeight,
+    int maxLines,
+    float *outWidth,
+    float *outHeight,
+    UINT32 *outLineCount
 );
 
 // Draw text on a D2D render target

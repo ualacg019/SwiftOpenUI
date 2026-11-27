@@ -88,7 +88,22 @@ public class D2DRenderer {
         bold: Bool = false,
         italic: Bool = false
     ) -> DWriteTextFormat? {
-        let key = TextFormatKey(fontSize: fontSize, bold: bold, italic: italic)
+        textFormat(
+            fontFamily: fontFamily,
+            fontSize: fontSize,
+            weight: bold ? 700 : 400,
+            italic: italic
+        )
+    }
+
+    /// Get or create a cached text format for the given family, size, numeric weight, and italic style.
+    public func textFormat(
+        fontFamily: String = "Segoe UI",
+        fontSize: Float = 14,
+        weight: Int,
+        italic: Bool = false
+    ) -> DWriteTextFormat? {
+        let key = TextFormatKey(fontFamily: fontFamily, fontSize: fontSize, weight: weight, italic: italic)
         if let cached = textFormatCache[key] {
             return cached
         }
@@ -96,7 +111,7 @@ public class D2DRenderer {
         guard let dwf = dwriteFactory else { return nil }
         var format: DWriteTextFormat?
         let hr = fontFamily.withCString(encodedAs: UTF16.self) { wstr in
-            dwrite_CreateTextFormat(dwf, wstr, fontSize, bold ? 1 : 0, italic ? 1 : 0, &format)
+            dwrite_CreateTextFormatWithWeight(dwf, wstr, fontSize, Int32(weight), italic ? 1 : 0, &format)
         }
         if hr >= 0, let fmt = format {
             dwrite_TextFormat_SetParagraphAlignment(fmt, 2) // vertically center
@@ -126,6 +141,29 @@ public class D2DRenderer {
         dwrite_TextLayout_GetMetrics(layout, &w, &h)
         dwrite_TextLayout_Release(layout)
         return (ceilf(w), ceilf(h))
+    }
+
+    /// Measure text with wrapping and optional line limit.
+    public func measureTextStyled(
+        _ text: String,
+        format: DWriteTextFormat,
+        maxWidth: Float = 10000,
+        maxHeight: Float = 10000,
+        maxLines: Int = 0
+    ) -> (width: Float, height: Float, lineCount: Int) {
+        guard let dwf = dwriteFactory else { return (0, 0, 0) }
+        var w: Float = 0
+        var h: Float = 0
+        var lines: UINT32 = 0
+        let hr = text.withCString(encodedAs: UTF16.self) { wstr in
+            dwrite_MeasureTextStyled(
+                dwf, wstr, UInt32(text.utf16.count), format,
+                maxWidth, maxHeight, Int32(maxLines),
+                &w, &h, &lines
+            )
+        }
+        guard hr >= 0 else { return (0, 0, 0) }
+        return (ceilf(w), ceilf(h), Int(lines))
     }
 
     /// Draw text onto a render target.
@@ -223,7 +261,8 @@ public class D2DRenderer {
 // MARK: - Text format cache key
 
 private struct TextFormatKey: Hashable {
+    let fontFamily: String
     let fontSize: Float
-    let bold: Bool
+    let weight: Int
     let italic: Bool
 }

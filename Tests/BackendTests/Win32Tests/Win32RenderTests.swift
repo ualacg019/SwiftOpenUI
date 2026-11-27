@@ -5036,6 +5036,139 @@ extension Win32RenderTests {
         XCTAssertEqual(buttonClicks, 2, "Child button should still receive both clicks")
         XCTAssertEqual(containerDoubleTaps, 0, "Double-clicking a child button must not trigger container double-tap")
     }
+
+    func testD2DTruncationModeHeadMiddleTail() {
+        let fmt = D2DRenderer.shared.textFormat(fontSize: 14)
+        XCTAssertNotNil(fmt)
+        guard let fmt else { return }
+
+        let longText = "The Pragmatic Programmer: Your Journey to Mastery"
+
+        let headTruncated = d2dTruncatedText(longText, mode: .head, format: fmt, maxWidth: 90, maxHeight: 24, maxLines: 1)
+        XCTAssertTrue(headTruncated.hasPrefix("\u{2026}"), "Head truncation must start with ellipsis")
+        XCTAssertLessThan(headTruncated.count, longText.count)
+        let headSuffix = String(headTruncated.dropFirst())
+        XCTAssertTrue(longText.hasSuffix(headSuffix), "Head truncation should preserve trailing suffix")
+
+        let middleTruncated = d2dTruncatedText(longText, mode: .middle, format: fmt, maxWidth: 90, maxHeight: 24, maxLines: 1)
+        XCTAssertTrue(middleTruncated.contains("\u{2026}"), "Middle truncation must contain ellipsis")
+        XCTAssertLessThan(middleTruncated.count, longText.count)
+        if let idx = middleTruncated.firstIndex(of: "\u{2026}") {
+            let prefix = String(middleTruncated[..<idx])
+            let suffix = String(middleTruncated[middleTruncated.index(after: idx)...])
+            XCTAssertTrue(longText.hasPrefix(prefix), "Middle truncation should preserve leading prefix")
+            XCTAssertTrue(longText.hasSuffix(suffix), "Middle truncation should preserve trailing suffix")
+        }
+
+        let multiline = "First line of text\nSecond line of text\nThird line of text\nFourth line of text"
+        let tailTruncated = d2dTruncatedText(multiline, mode: .tail, format: fmt, maxWidth: 80, maxHeight: 40, maxLines: 2)
+        XCTAssertTrue(tailTruncated.hasSuffix("\u{2026}"), "Multi-line tail truncation should end with ellipsis")
+        XCTAssertLessThan(tailTruncated.count, multiline.count)
+
+        for mode in [TruncationMode.head, .middle, .tail] {
+            let untouched = d2dTruncatedText(longText, mode: mode, format: fmt, maxWidth: 500, maxHeight: 40, maxLines: 1)
+            XCTAssertEqual(untouched, longText, "Text that fits should not be truncated")
+        }
+
+        let ctx = testContext()
+        let view = Text("Long book title")
+            .truncationMode(.middle)
+            .frame(width: 60, height: 22)
+            .rotationEffect(.degrees(-90))
+        let hwnd = winRenderView(view, in: ctx)
+        XCTAssertNotNil(hwnd)
+        if let hwnd {
+            _ = SendMessageW(hwnd, UINT(WM_PAINT), 0, 0)
+        }
+    }
+
+    func testD2DLineLimitMeasurementAndClamping() {
+        let longText = Text("This is a relatively long text string that will wrap across several lines inside a narrow frame")
+
+        let h1 = d2dMeasure(longText.lineLimit(1).frame(width: 70), dpiScale: 1.0).height
+        let h2 = d2dMeasure(longText.lineLimit(2).frame(width: 70), dpiScale: 1.0).height
+        let hUnlim = d2dMeasure(longText.lineLimit(nil).frame(width: 70), dpiScale: 1.0).height
+
+        XCTAssertLessThan(h1, h2, "lineLimit(1) height should be smaller than lineLimit(2) inside a narrow frame")
+        XCTAssertLessThan(h2, hUnlim, "lineLimit(2) height should be smaller than unlimited height inside a narrow frame")
+
+        let explicitLines = Text("L1\nL2\nL3\nL4")
+        let explicitLimited = d2dMeasure(explicitLines.lineLimit(2), dpiScale: 1.0).height
+        let explicitUnlimited = d2dMeasure(explicitLines.lineLimit(nil), dpiScale: 1.0).height
+        XCTAssertLessThan(explicitLimited, explicitUnlimited, "Explicit newline text with lineLimit(2) must be shorter than unlimited")
+
+        let ctx = testContext()
+        let clampedView = longText
+            .lineLimit(2)
+            .frame(width: 70, height: 14)
+            .rotationEffect(.degrees(-90))
+        let hwnd = winRenderView(clampedView, in: ctx)
+        XCTAssertNotNil(hwnd)
+        if let hwnd {
+            _ = SendMessageW(hwnd, UINT(WM_PAINT), 0, 0)
+        }
+    }
+
+    func testD2DFontWeightAndFamilyCacheDistinct() {
+        let segoe = D2DRenderer.shared.textFormat(fontFamily: "Segoe UI", fontSize: 15, weight: 400)
+        let consolas = D2DRenderer.shared.textFormat(fontFamily: "Consolas", fontSize: 15, weight: 400)
+        XCTAssertNotNil(segoe)
+        XCTAssertNotNil(consolas)
+        XCTAssertNotEqual(segoe, consolas, "Different font families must produce distinct cached DWriteTextFormat handles")
+
+        let w400 = D2DRenderer.shared.textFormat(fontFamily: "Segoe UI", fontSize: 15, weight: 400)
+        let w600 = D2DRenderer.shared.textFormat(fontFamily: "Segoe UI", fontSize: 15, weight: 600)
+        let w700 = D2DRenderer.shared.textFormat(fontFamily: "Segoe UI", fontSize: 15, weight: 700)
+        let w900 = D2DRenderer.shared.textFormat(fontFamily: "Segoe UI", fontSize: 15, weight: 900)
+        XCTAssertEqual(segoe, w400, "Repeated lookup with identical parameters should return cached handle")
+        XCTAssertEqual(Set([w400, w600, w700, w900].compactMap { $0 }).count, 4,
+                       "Weights 400, 600, 700, 900 must produce distinct DWriteTextFormat handles")
+
+        let ctx = testContext()
+        let view = Text("Mono")
+            .font(.system(size: 13, weight: .semibold, design: .monospaced))
+            .rotationEffect(.degrees(-90))
+        let hwnd = winRenderView(view, in: ctx)
+        XCTAssertNotNil(hwnd)
+        if let hwnd {
+            _ = SendMessageW(hwnd, UINT(WM_PAINT), 0, 0)
+        }
+    }
+
+    func testWin32HybridRunLoopFiresFoundationTimersAndWakesOnMessage() {
+        ensureTestWindow()
+        var fireCount = 0
+        let timer = Timer.scheduledTimer(withTimeInterval: 0.02, repeats: true) { _ in
+            fireCount += 1
+        }
+        defer { timer.invalidate() }
+
+        let deadline = Date(timeIntervalSinceNow: 1.5)
+        var msg = MSG()
+        while fireCount < 3 && Date() < deadline {
+            while PeekMessageW(&msg, nil, 0, 0, UINT(PM_REMOVE)) {
+                TranslateMessage(&msg)
+                DispatchMessageW(&msg)
+            }
+            win32PumpFoundationRunLoopOnce()
+            if PeekMessageW(&msg, nil, 0, 0, UINT(PM_NOREMOVE)) {
+                continue
+            }
+            let waitMs = max(1, win32ComputeRunLoopWaitMs())
+            _ = win32_MsgWaitForInput(waitMs)
+        }
+
+        XCTAssertGreaterThanOrEqual(fireCount, 3, "Hybrid Win32 + Foundation RunLoop must fire scheduled Timers")
+
+        _ = PostMessageW(testWindow, UINT(WM_NULL), 0, 0)
+        let start = Date()
+        _ = win32_MsgWaitForInput(500)
+        let elapsed = Date().timeIntervalSince(start)
+        XCTAssertLessThan(elapsed, 0.15, "win32_MsgWaitForInput must wake immediately when a Win32 message is posted")
+
+        while PeekMessageW(&msg, testWindow, UINT(WM_NULL), UINT(WM_NULL), UINT(PM_REMOVE)) {
+        }
+    }
 }
 
 private func findFirstViewHost(in parent: HWND, excluding: HWND) -> Win32ViewHost? {

@@ -816,9 +816,7 @@ public struct Win32Backend: RenderBackend {
 
             // Pump ready Foundation sources (Timer, MainActor/libdispatch main queue)
             // without blocking Win32 message dispatch.
-            let now = Date.distantPast
-            _ = RunLoop.main.run(mode: .default, before: now)
-            _ = RunLoop.main.run(mode: .common, before: now)
+            win32PumpFoundationRunLoopOnce()
 
             // If Foundation work posted Win32 messages (e.g. WM_SWIFTUI_REBUILD),
             // process them immediately instead of sleeping.
@@ -826,16 +824,54 @@ public struct Win32Backend: RenderBackend {
                 continue
             }
 
+            // If another Foundation timer became due immediately, pump once more before sleeping.
+            var waitMs = win32ComputeRunLoopWaitMs()
+            if waitMs == 0 {
+                win32PumpFoundationRunLoopOnce(maxIterations: 1)
+                if PeekMessageW(&msg, nil, 0, 0, UINT(PM_NOREMOVE)) {
+                    continue
+                }
+                waitMs = max(1, win32ComputeRunLoopWaitMs())
+            }
+
             // Sleep until the next Win32 message arrives OR the next Foundation
             // timer / 16ms tick, avoiding 100% CPU busy-waiting.
-            var waitMs: DWORD = 16
-            if let nextDate = RunLoop.main.limitDate(forMode: .default) {
-                let deltaMs = min(16.0, max(1.0, (nextDate.timeIntervalSinceNow * 1000.0).rounded(.up)))
-                waitMs = DWORD(deltaMs)
-            }
             _ = win32_MsgWaitForInput(waitMs)
         }
     }
+}
+
+/// Pump ready Foundation RunLoop sources (Timer, Dispatch main) without blocking Win32 input.
+internal func win32PumpFoundationRunLoopOnce(maxIterations: Int = 8) {
+    for _ in 0..<maxIterations {
+        let ran = RunLoop.main.run(mode: .default, before: Date())
+        guard ran else { break }
+        if let next = RunLoop.main.limitDate(forMode: .default),
+           next.timeIntervalSinceNow > 0 {
+            break
+        }
+    }
+    _ = RunLoop.main.run(mode: .common, before: Date())
+}
+
+/// Compute how long the hybrid Win32 message loop should sleep (in ms) before the next
+/// Foundation timer is due, clamped to [0, maxWaitMs].
+internal func win32ComputeRunLoopWaitMs(maxWaitMs: DWORD = 16) -> DWORD {
+    let defaultDate = RunLoop.main.limitDate(forMode: .default)
+    let commonDate = RunLoop.main.limitDate(forMode: .common)
+    let earliest: Date?
+    switch (defaultDate, commonDate) {
+    case let (d?, c?): earliest = min(d, c)
+    case let (d?, nil): earliest = d
+    case let (nil, c?): earliest = c
+    case (nil, nil): earliest = nil
+    }
+    guard let nextDate = earliest else { return maxWaitMs }
+    let intervalMs = nextDate.timeIntervalSinceNow * 1000.0
+    if intervalMs <= 0 {
+        return 0
+    }
+    return DWORD(min(Double(maxWaitMs), max(1.0, intervalMs.rounded(.up))))
 }
 
 /// Recursively render a Scene.

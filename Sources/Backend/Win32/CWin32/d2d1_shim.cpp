@@ -223,6 +223,33 @@ HRESULT dwrite_CreateTextFormat(
     );
 }
 
+HRESULT dwrite_CreateTextFormatWithWeight(
+    DWriteFactory factory,
+    const WCHAR *fontFamily,
+    float fontSize,
+    int weight,
+    int italic,
+    DWriteTextFormat *ppFormat
+) {
+    if (!factory || !fontFamily || !ppFormat) {
+        return E_INVALIDARG;
+    }
+    int clampedWeight = weight <= 0 ? DWRITE_FONT_WEIGHT_NORMAL : weight;
+    if (clampedWeight < 1) clampedWeight = 1;
+    if (clampedWeight > 999) clampedWeight = 999;
+    DWRITE_FONT_WEIGHT dwWeight = static_cast<DWRITE_FONT_WEIGHT>(clampedWeight);
+    return AS_DWRITE_FACTORY(factory)->CreateTextFormat(
+        fontFamily,
+        NULL,
+        dwWeight,
+        italic ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL,
+        fontSize,
+        L"en-us",
+        reinterpret_cast<IDWriteTextFormat **>(ppFormat)
+    );
+}
+
 void dwrite_TextFormat_Release(DWriteTextFormat format) {
     if (format) AS_TEXT_FORMAT(format)->Release();
 }
@@ -280,6 +307,77 @@ HRESULT dwrite_TextLayout_GetMetrics(
         if (outHeight) *outHeight = metrics.height;
     }
     return hr;
+}
+
+HRESULT dwrite_MeasureTextStyled(
+    DWriteFactory factory,
+    const WCHAR *text,
+    UINT32 textLength,
+    DWriteTextFormat format,
+    float maxWidth,
+    float maxHeight,
+    int maxLines,
+    float *outWidth,
+    float *outHeight,
+    UINT32 *outLineCount
+) {
+    if (!factory || !format) {
+        return E_INVALIDARG;
+    }
+
+    IDWriteTextLayout *layout = nullptr;
+    HRESULT hr = AS_DWRITE_FACTORY(factory)->CreateTextLayout(
+        text, textLength,
+        AS_TEXT_FORMAT(format),
+        maxWidth, maxHeight,
+        &layout
+    );
+    if (FAILED(hr) || !layout) {
+        return FAILED(hr) ? hr : E_FAIL;
+    }
+
+    layout->SetWordWrapping(maxLines == 1 ? DWRITE_WORD_WRAPPING_NO_WRAP : DWRITE_WORD_WRAPPING_WRAP);
+
+    DWRITE_TEXT_METRICS metrics;
+    hr = layout->GetMetrics(&metrics);
+    if (FAILED(hr)) {
+        layout->Release();
+        return hr;
+    }
+
+    float measuredW = metrics.width;
+    float measuredH = metrics.height;
+    UINT32 lineCount = metrics.lineCount;
+
+    if (maxLines >= 1 && lineCount > static_cast<UINT32>(maxLines)) {
+        DWRITE_LINE_METRICS stackMetrics[16];
+        DWRITE_LINE_METRICS *lineMetrics = stackMetrics;
+        if (lineCount > 16) {
+            lineMetrics = static_cast<DWRITE_LINE_METRICS *>(malloc(sizeof(DWRITE_LINE_METRICS) * lineCount));
+        }
+        UINT32 actualCount = lineCount;
+        if (lineMetrics && SUCCEEDED(layout->GetLineMetrics(lineMetrics, lineCount, &actualCount))) {
+            float cappedHeight = 0.0f;
+            UINT32 limit = static_cast<UINT32>(maxLines);
+            if (actualCount < limit) limit = actualCount;
+            for (UINT32 i = 0; i < limit; ++i) {
+                cappedHeight += lineMetrics[i].height;
+            }
+            if (cappedHeight > 0.0f) {
+                measuredH = cappedHeight;
+            }
+        }
+        if (lineMetrics && lineMetrics != stackMetrics) {
+            free(lineMetrics);
+        }
+    }
+
+    if (outWidth) *outWidth = measuredW;
+    if (outHeight) *outHeight = measuredH;
+    if (outLineCount) *outLineCount = lineCount;
+
+    layout->Release();
+    return S_OK;
 }
 
 void d2d1_RenderTarget_DrawText(
@@ -345,7 +443,7 @@ void d2d1_RenderTarget_DrawTextStyled(
     float clipH = height;
     bool clamped = false;
 
-    if (maxLines > 1) {
+    if (maxLines >= 1) {
         UINT32 lineCount = 0;
         layout->GetLineMetrics(nullptr, 0, &lineCount);
         if (lineCount > static_cast<UINT32>(maxLines)) {
@@ -359,11 +457,12 @@ void d2d1_RenderTarget_DrawTextStyled(
                 for (UINT32 i = 0; i < static_cast<UINT32>(maxLines); ++i) {
                     cappedHeight += metrics[i].height;
                 }
-                if (cappedHeight > 0.0f && cappedHeight < height) {
+                if (cappedHeight > 0.0f) {
+                    float effectiveH = (cappedHeight < height) ? cappedHeight : height;
                     layout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
-                    layout->SetMaxHeight(cappedHeight);
-                    drawY = y + (height - cappedHeight) * 0.5f;
-                    clipH = cappedHeight;
+                    layout->SetMaxHeight(effectiveH);
+                    drawY = (cappedHeight < height) ? (y + (height - cappedHeight) * 0.5f) : y;
+                    clipH = effectiveH;
                     clamped = true;
                 }
             }
@@ -374,7 +473,13 @@ void d2d1_RenderTarget_DrawTextStyled(
     }
 
     if (!clamped) {
-        layout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        DWRITE_TEXT_METRICS tm;
+        if (SUCCEEDED(layout->GetMetrics(&tm)) && tm.height > height) {
+            layout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+            layout->SetMaxHeight(height);
+        } else {
+            layout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        }
     }
 
     if (textLength > 0) {

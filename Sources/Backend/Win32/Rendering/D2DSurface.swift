@@ -15,12 +15,13 @@ import Foundation
 /// Inherited text/color/layout styling accumulated down a D2D-renderable subtree.
 struct D2DTextStyle {
     var font: Font = .body
-    var boldOverride: Bool = false
+    var weightOverride: FontWeight? = nil
     var italicOverride: Bool = false
     var color: (r: Float, g: Float, b: Float, a: Float) = (0, 0, 0, 1)
     var opacity: Float = 1.0
     var alignment: TextAlignment = .leading
     var lineLimit: Int? = nil
+    var truncationMode: TruncationMode = .tail
     var strikethrough: Bool = false
     var underline: Bool = false
     var textCase: TextCaseType? = nil
@@ -121,17 +122,33 @@ private func applyTextCase(_ string: String, textCase: TextCaseType?) -> String 
 }
 
 /// Measure a D2D-renderable view's size.
-func d2dMeasure<V: View>(_ view: V, style: D2DTextStyle = D2DTextStyle(), dpiScale: Float) -> (width: Float, height: Float) {
+func d2dMeasure<V: View>(
+    _ view: V,
+    style: D2DTextStyle = D2DTextStyle(),
+    maxWidth: Float? = nil,
+    dpiScale: Float
+) -> (width: Float, height: Float) {
     if let text = view as? Text {
         let contentStr = applyTextCase(text.content, textCase: style.textCase)
-        let (fontSize, baseBold, baseItalic) = fontParametersForD2D(style.font)
-        let bold = baseBold || style.boldOverride
+        let (fontSize, baseWeight, family, baseItalic) = fontParametersForD2D(style.font)
+        let weight = dwriteFontWeight(for: style.weightOverride ?? baseWeight)
         let italic = baseItalic || style.italicOverride
-        guard let fmt = D2DRenderer.shared.textFormat(fontSize: fontSize * dpiScale, bold: bold, italic: italic) else {
+        guard let fmt = D2DRenderer.shared.textFormat(
+            fontFamily: family,
+            fontSize: fontSize * dpiScale,
+            weight: weight,
+            italic: italic
+        ) else {
             return (0, 0)
         }
-        let (w, h) = D2DRenderer.shared.measureText(contentStr, format: fmt)
-        return (w + 4 * dpiScale, h + 2 * dpiScale)
+        let m = D2DRenderer.shared.measureTextStyled(
+            contentStr,
+            format: fmt,
+            maxWidth: maxWidth ?? 10000,
+            maxHeight: 10000,
+            maxLines: style.lineLimit ?? 0
+        )
+        return (m.width + 4 * dpiScale, m.height + 2 * dpiScale)
     }
     if view is Color {
         return (20, 20) // natural size, will expand in container
@@ -143,108 +160,117 @@ func d2dMeasure<V: View>(_ view: V, style: D2DTextStyle = D2DTextStyle(), dpiSca
         return (0, 0)
     }
     if let v = view as? any _D2DMeasurable {
-        return v._d2dMeasureContent(style: style, dpiScale: dpiScale)
+        return v._d2dMeasureContent(style: style, maxWidth: maxWidth, dpiScale: dpiScale)
     }
     return (0, 0)
 }
 
 /// Internal protocol for measuring through wrapper modifiers.
 protocol _D2DMeasurable {
-    func _d2dMeasureContent(style: D2DTextStyle, dpiScale: Float) -> (width: Float, height: Float)
+    func _d2dMeasureContent(style: D2DTextStyle, maxWidth: Float?, dpiScale: Float) -> (width: Float, height: Float)
 }
 
 extension ForegroundColorView: _D2DMeasurable {
-    func _d2dMeasureContent(style: D2DTextStyle, dpiScale: Float) -> (width: Float, height: Float) {
-        d2dMeasure(content, style: style, dpiScale: dpiScale)
+    func _d2dMeasureContent(style: D2DTextStyle, maxWidth: Float?, dpiScale: Float) -> (width: Float, height: Float) {
+        d2dMeasure(content, style: style, maxWidth: maxWidth, dpiScale: dpiScale)
     }
 }
 
 extension FontModifiedView: _D2DMeasurable {
-    func _d2dMeasureContent(style: D2DTextStyle, dpiScale: Float) -> (width: Float, height: Float) {
+    func _d2dMeasureContent(style: D2DTextStyle, maxWidth: Float?, dpiScale: Float) -> (width: Float, height: Float) {
         var s = style
         s.font = font
-        return d2dMeasure(content, style: s, dpiScale: dpiScale)
+        return d2dMeasure(content, style: s, maxWidth: maxWidth, dpiScale: dpiScale)
     }
 }
 
 extension BoldView: _D2DMeasurable {
-    func _d2dMeasureContent(style: D2DTextStyle, dpiScale: Float) -> (width: Float, height: Float) {
+    func _d2dMeasureContent(style: D2DTextStyle, maxWidth: Float?, dpiScale: Float) -> (width: Float, height: Float) {
         var s = style
-        s.boldOverride = true
-        return d2dMeasure(content, style: s, dpiScale: dpiScale)
+        s.weightOverride = .bold
+        return d2dMeasure(content, style: s, maxWidth: maxWidth, dpiScale: dpiScale)
     }
 }
 
 extension ItalicView: _D2DMeasurable {
-    func _d2dMeasureContent(style: D2DTextStyle, dpiScale: Float) -> (width: Float, height: Float) {
+    func _d2dMeasureContent(style: D2DTextStyle, maxWidth: Float?, dpiScale: Float) -> (width: Float, height: Float) {
         var s = style
         s.italicOverride = true
-        return d2dMeasure(content, style: s, dpiScale: dpiScale)
+        return d2dMeasure(content, style: s, maxWidth: maxWidth, dpiScale: dpiScale)
     }
 }
 
 extension FontWeightView: _D2DMeasurable {
-    func _d2dMeasureContent(style: D2DTextStyle, dpiScale: Float) -> (width: Float, height: Float) {
+    func _d2dMeasureContent(style: D2DTextStyle, maxWidth: Float?, dpiScale: Float) -> (width: Float, height: Float) {
         var s = style
-        if weight == .bold || weight == .semibold || weight == .heavy || weight == .black {
-            s.boldOverride = true
-        }
-        return d2dMeasure(content, style: s, dpiScale: dpiScale)
+        s.weightOverride = weight
+        return d2dMeasure(content, style: s, maxWidth: maxWidth, dpiScale: dpiScale)
     }
 }
 
 extension StrikethroughView: _D2DMeasurable {
-    func _d2dMeasureContent(style: D2DTextStyle, dpiScale: Float) -> (width: Float, height: Float) {
-        d2dMeasure(content, style: style, dpiScale: dpiScale)
+    func _d2dMeasureContent(style: D2DTextStyle, maxWidth: Float?, dpiScale: Float) -> (width: Float, height: Float) {
+        d2dMeasure(content, style: style, maxWidth: maxWidth, dpiScale: dpiScale)
     }
 }
 
 extension UnderlineView: _D2DMeasurable {
-    func _d2dMeasureContent(style: D2DTextStyle, dpiScale: Float) -> (width: Float, height: Float) {
-        d2dMeasure(content, style: style, dpiScale: dpiScale)
+    func _d2dMeasureContent(style: D2DTextStyle, maxWidth: Float?, dpiScale: Float) -> (width: Float, height: Float) {
+        d2dMeasure(content, style: style, maxWidth: maxWidth, dpiScale: dpiScale)
     }
 }
 
 extension MultilineTextAlignmentView: _D2DMeasurable {
-    func _d2dMeasureContent(style: D2DTextStyle, dpiScale: Float) -> (width: Float, height: Float) {
-        d2dMeasure(content, style: style, dpiScale: dpiScale)
+    func _d2dMeasureContent(style: D2DTextStyle, maxWidth: Float?, dpiScale: Float) -> (width: Float, height: Float) {
+        d2dMeasure(content, style: style, maxWidth: maxWidth, dpiScale: dpiScale)
     }
 }
 
 extension LineLimitView: _D2DMeasurable {
-    func _d2dMeasureContent(style: D2DTextStyle, dpiScale: Float) -> (width: Float, height: Float) {
-        d2dMeasure(content, style: style, dpiScale: dpiScale)
+    func _d2dMeasureContent(style: D2DTextStyle, maxWidth: Float?, dpiScale: Float) -> (width: Float, height: Float) {
+        var s = style
+        s.lineLimit = lineLimit
+        return d2dMeasure(content, style: s, maxWidth: maxWidth, dpiScale: dpiScale)
     }
 }
 
 extension TruncationModeView: _D2DMeasurable {
-    func _d2dMeasureContent(style: D2DTextStyle, dpiScale: Float) -> (width: Float, height: Float) {
-        d2dMeasure(content, style: style, dpiScale: dpiScale)
+    func _d2dMeasureContent(style: D2DTextStyle, maxWidth: Float?, dpiScale: Float) -> (width: Float, height: Float) {
+        d2dMeasure(content, style: style, maxWidth: maxWidth, dpiScale: dpiScale)
     }
 }
 
 extension TextCaseView: _D2DMeasurable {
-    func _d2dMeasureContent(style: D2DTextStyle, dpiScale: Float) -> (width: Float, height: Float) {
+    func _d2dMeasureContent(style: D2DTextStyle, maxWidth: Float?, dpiScale: Float) -> (width: Float, height: Float) {
         var s = style
         s.textCase = textCase
-        return d2dMeasure(content, style: s, dpiScale: dpiScale)
+        return d2dMeasure(content, style: s, maxWidth: maxWidth, dpiScale: dpiScale)
     }
 }
 
 extension PaddedView: _D2DMeasurable {
-    func _d2dMeasureContent(style: D2DTextStyle, dpiScale: Float) -> (width: Float, height: Float) {
-        let inner = d2dMeasure(content, style: style, dpiScale: dpiScale)
+    func _d2dMeasureContent(style: D2DTextStyle, maxWidth: Float?, dpiScale: Float) -> (width: Float, height: Float) {
+        let innerMaxW = maxWidth.map { max(0, $0 - Float(leading + trailing) * dpiScale) }
+        let inner = d2dMeasure(content, style: style, maxWidth: innerMaxW, dpiScale: dpiScale)
         return (inner.width + Float(leading + trailing) * dpiScale,
                 inner.height + Float(top + bottom) * dpiScale)
     }
 }
 
 extension FrameView: _D2DMeasurable {
-    func _d2dMeasureContent(style: D2DTextStyle, dpiScale: Float) -> (width: Float, height: Float) {
+    func _d2dMeasureContent(style: D2DTextStyle, maxWidth outerMaxWidth: Float?, dpiScale: Float) -> (width: Float, height: Float) {
         if let w = width, let h = height {
             return (Float(w) * dpiScale, Float(h) * dpiScale)
         }
-        let inner = d2dMeasure(content, style: style, dpiScale: dpiScale)
+        let innerMaxW: Float?
+        if let w = width {
+            innerMaxW = Float(w) * dpiScale
+        } else if let maxW = maxWidth, maxW.isFinite {
+            innerMaxW = min(outerMaxWidth ?? .infinity, Float(maxW) * dpiScale)
+        } else {
+            innerMaxW = outerMaxWidth
+        }
+        let inner = d2dMeasure(content, style: style, maxWidth: innerMaxW, dpiScale: dpiScale)
         var w = width.map { Float($0) * dpiScale } ?? inner.width
         var h = height.map { Float($0) * dpiScale } ?? inner.height
         if width == nil {
@@ -260,21 +286,21 @@ extension FrameView: _D2DMeasurable {
 }
 
 extension ScaleEffectView: _D2DMeasurable {
-    func _d2dMeasureContent(style: D2DTextStyle, dpiScale: Float) -> (width: Float, height: Float) {
-        let inner = d2dMeasure(content, style: style, dpiScale: dpiScale)
+    func _d2dMeasureContent(style: D2DTextStyle, maxWidth: Float?, dpiScale: Float) -> (width: Float, height: Float) {
+        let inner = d2dMeasure(content, style: style, maxWidth: maxWidth, dpiScale: dpiScale)
         return (inner.width * Float(scaleX), inner.height * Float(scaleY))
     }
 }
 
 extension OpacityView: _D2DMeasurable {
-    func _d2dMeasureContent(style: D2DTextStyle, dpiScale: Float) -> (width: Float, height: Float) {
-        d2dMeasure(content, style: style, dpiScale: dpiScale)
+    func _d2dMeasureContent(style: D2DTextStyle, maxWidth: Float?, dpiScale: Float) -> (width: Float, height: Float) {
+        d2dMeasure(content, style: style, maxWidth: maxWidth, dpiScale: dpiScale)
     }
 }
 
 extension RotationView: _D2DMeasurable {
-    func _d2dMeasureContent(style: D2DTextStyle, dpiScale: Float) -> (width: Float, height: Float) {
-        let inner = d2dMeasure(content, style: style, dpiScale: dpiScale)
+    func _d2dMeasureContent(style: D2DTextStyle, maxWidth: Float?, dpiScale: Float) -> (width: Float, height: Float) {
+        let inner = d2dMeasure(content, style: style, maxWidth: maxWidth, dpiScale: dpiScale)
         // Compute rotated bounding box
         let rad = Float(angle) * .pi / 180.0
         let cosA = abs(cos(rad))
@@ -291,10 +317,15 @@ func d2dDraw<V: View>(_ view: V, style: D2DTextStyle = D2DTextStyle(),
                        x: Float, y: Float, width: Float, height: Float, dpiScale: Float) {
     if let text = view as? Text {
         let contentStr = applyTextCase(text.content, textCase: style.textCase)
-        let (fontSize, baseBold, baseItalic) = fontParametersForD2D(style.font)
-        let bold = baseBold || style.boldOverride
+        let (fontSize, baseWeight, family, baseItalic) = fontParametersForD2D(style.font)
+        let weight = dwriteFontWeight(for: style.weightOverride ?? baseWeight)
         let italic = baseItalic || style.italicOverride
-        guard let fmt = D2DRenderer.shared.textFormat(fontSize: fontSize * dpiScale, bold: bold, italic: italic) else {
+        guard let fmt = D2DRenderer.shared.textFormat(
+            fontFamily: family,
+            fontSize: fontSize * dpiScale,
+            weight: weight,
+            italic: italic
+        ) else {
             return
         }
         d2d1_SolidColorBrush_SetColor(brush, style.color.r, style.color.g, style.color.b,
@@ -305,11 +336,20 @@ func d2dDraw<V: View>(_ view: V, style: D2DTextStyle = D2DTextStyle(),
         case .trailing: alignCode = 1
         case .center:   alignCode = 2
         }
+        let maxLines = style.lineLimit ?? 0
+        let drawnStr = d2dTruncatedText(
+            contentStr,
+            mode: style.truncationMode,
+            format: fmt,
+            maxWidth: width,
+            maxHeight: height,
+            maxLines: maxLines
+        )
         D2DRenderer.shared.drawTextStyled(
-            contentStr, target: target, format: fmt, brush: brush,
+            drawnStr, target: target, format: fmt, brush: brush,
             x: x, y: y, width: width, height: height,
             alignment: alignCode,
-            maxLines: style.lineLimit ?? 0,
+            maxLines: maxLines,
             strikethrough: style.strikethrough,
             underline: style.underline
         )
@@ -364,7 +404,7 @@ extension BoldView: _D2DDrawable {
     func _d2dDrawContent(style: D2DTextStyle, target: D2DRenderTarget, brush: D2DBrush,
                          x: Float, y: Float, width: Float, height: Float, dpiScale: Float) {
         var s = style
-        s.boldOverride = true
+        s.weightOverride = .bold
         d2dDraw(content, style: s, target: target, brush: brush,
                 x: x, y: y, width: width, height: height, dpiScale: dpiScale)
     }
@@ -384,9 +424,7 @@ extension FontWeightView: _D2DDrawable {
     func _d2dDrawContent(style: D2DTextStyle, target: D2DRenderTarget, brush: D2DBrush,
                          x: Float, y: Float, width: Float, height: Float, dpiScale: Float) {
         var s = style
-        if weight == .bold || weight == .semibold || weight == .heavy || weight == .black {
-            s.boldOverride = true
-        }
+        s.weightOverride = weight
         d2dDraw(content, style: s, target: target, brush: brush,
                 x: x, y: y, width: width, height: height, dpiScale: dpiScale)
     }
@@ -435,7 +473,9 @@ extension LineLimitView: _D2DDrawable {
 extension TruncationModeView: _D2DDrawable {
     func _d2dDrawContent(style: D2DTextStyle, target: D2DRenderTarget, brush: D2DBrush,
                          x: Float, y: Float, width: Float, height: Float, dpiScale: Float) {
-        d2dDraw(content, style: style, target: target, brush: brush,
+        var s = style
+        s.truncationMode = mode
+        d2dDraw(content, style: s, target: target, brush: brush,
                 x: x, y: y, width: width, height: height, dpiScale: dpiScale)
     }
 }
@@ -499,16 +539,42 @@ extension ScaleEffectView: _D2DDrawable {
         // For text content, approximate scale via font size
         if let text = content as? Text {
             let scale = max(scaleX, scaleY)
-            let (baseFontSize, baseBold, baseItalic) = fontParametersForD2D(style.font)
-            let bold = baseBold || style.boldOverride
+            let (baseFontSize, baseWeight, family, baseItalic) = fontParametersForD2D(style.font)
+            let weight = dwriteFontWeight(for: style.weightOverride ?? baseWeight)
             let italic = baseItalic || style.italicOverride
             let scaledSize = baseFontSize * Float(scale) * dpiScale
-            guard let fmt = D2DRenderer.shared.textFormat(fontSize: scaledSize, bold: bold, italic: italic) else { return }
+            guard let fmt = D2DRenderer.shared.textFormat(
+                fontFamily: family,
+                fontSize: scaledSize,
+                weight: weight,
+                italic: italic
+            ) else { return }
             d2d1_SolidColorBrush_SetColor(brush, style.color.r, style.color.g, style.color.b,
                                            style.color.a * style.opacity)
-            D2DRenderer.shared.drawText(applyTextCase(text.content, textCase: style.textCase),
-                                         target: target, format: fmt,
-                                         brush: brush, x: x, y: y, width: width, height: height)
+            let alignCode: Int
+            switch style.alignment {
+            case .leading:  alignCode = 0
+            case .trailing: alignCode = 1
+            case .center:   alignCode = 2
+            }
+            let maxLines = style.lineLimit ?? 0
+            let contentStr = applyTextCase(text.content, textCase: style.textCase)
+            let drawnStr = d2dTruncatedText(
+                contentStr,
+                mode: style.truncationMode,
+                format: fmt,
+                maxWidth: width,
+                maxHeight: height,
+                maxLines: maxLines
+            )
+            D2DRenderer.shared.drawTextStyled(
+                drawnStr, target: target, format: fmt, brush: brush,
+                x: x, y: y, width: width, height: height,
+                alignment: alignCode,
+                maxLines: maxLines,
+                strikethrough: style.strikethrough,
+                underline: style.underline
+            )
         } else {
             // For non-text, just draw at natural size (scale not fully supported)
             d2dDraw(content, style: style, target: target, brush: brush,
@@ -557,23 +623,120 @@ extension RotationView: _D2DDrawable {
     }
 }
 
+/// Map SwiftOpenUI FontWeight to DirectWrite numeric weight (100..900).
+internal func dwriteFontWeight(for weight: FontWeight) -> Int {
+    switch weight {
+    case .thin:       return 100
+    case .ultraLight: return 200
+    case .light:      return 300
+    case .regular:    return 400
+    case .medium:     return 500
+    case .semibold:   return 600
+    case .bold:       return 700
+    case .heavy:      return 800
+    case .black:      return 900
+    }
+}
+
+/// Map SwiftOpenUI FontDesign to a Windows font family.
+internal func dwriteFontFamily(for design: FontDesign) -> String {
+    switch design {
+    case .default:    return "Segoe UI"
+    case .monospaced: return "Consolas"
+    case .rounded:    return "Segoe UI"
+    case .serif:      return "Georgia"
+    }
+}
+
+/// Truncate text with an ellipsis according to `mode` when it overflows the box or `maxLines`.
+internal func d2dTruncatedText(
+    _ text: String,
+    mode: TruncationMode,
+    format: DWriteTextFormat,
+    maxWidth: Float,
+    maxHeight: Float,
+    maxLines: Int
+) -> String {
+    guard !text.isEmpty, maxWidth > 0, maxHeight > 0 else { return text }
+
+    func fits(_ candidate: String) -> Bool {
+        let m = D2DRenderer.shared.measureTextStyled(
+            candidate,
+            format: format,
+            maxWidth: maxWidth,
+            maxHeight: 10000,
+            maxLines: maxLines
+        )
+        let linesOk = (maxLines <= 0) || (m.lineCount <= maxLines)
+        return m.width <= maxWidth + 0.5 && m.height <= maxHeight + 0.5 && linesOk
+    }
+
+    if fits(text) {
+        return text
+    }
+
+    // For single-line .tail without explicit newlines, let DirectWrite's trimming sign handle it.
+    if mode == .tail && maxLines == 1 && !text.contains("\n") && !text.contains("\r") {
+        let m = D2DRenderer.shared.measureTextStyled(
+            text,
+            format: format,
+            maxWidth: maxWidth,
+            maxHeight: 10000,
+            maxLines: 1
+        )
+        if m.lineCount <= 1 {
+            return text
+        }
+    }
+
+    let chars = Array(text)
+    let ellipsis = "\u{2026}"
+
+    func makeCandidate(_ keepCount: Int) -> String {
+        let k = max(0, min(keepCount, chars.count))
+        switch mode {
+        case .tail:
+            return String(chars.prefix(k)) + ellipsis
+        case .head:
+            return ellipsis + String(chars.suffix(k))
+        case .middle:
+            let left = (k + 1) / 2
+            let right = k - left
+            return String(chars.prefix(left)) + ellipsis + String(chars.suffix(right))
+        }
+    }
+
+    var lo = 0
+    var hi = chars.count - 1
+    var best = 0
+    while lo <= hi {
+        let mid = lo + (hi - lo) / 2
+        if fits(makeCandidate(mid)) {
+            best = mid
+            lo = mid + 1
+        } else {
+            hi = mid - 1
+        }
+    }
+    return makeCandidate(best)
+}
+
 /// Extract font parameters for D2D text format.
-private func fontParametersForD2D(_ font: Font) -> (fontSize: Float, bold: Bool, italic: Bool) {
+private func fontParametersForD2D(_ font: Font) -> (fontSize: Float, weight: FontWeight, family: String, italic: Bool) {
     switch font {
-    case .largeTitle:  return (28, false, false)
-    case .title:       return (24, false, false)
-    case .title2:      return (20, true, false)
-    case .title3:      return (18, false, false)
-    case .headline:    return (14, true, false)
-    case .subheadline: return (12, true, false)
-    case .body:        return (14, false, false)
-    case .callout:     return (12, false, false)
-    case .footnote:    return (10, false, false)
-    case .caption:     return (12, false, false)
-    case .caption2:    return (10, true, false)
-    case .custom(let size, let w, _):
-        let bold = w == .bold || w == .semibold || w == .heavy || w == .black
-        return (Float(size), bold, false)
+    case .largeTitle:  return (28, .regular, "Segoe UI", false)
+    case .title:       return (24, .regular, "Segoe UI", false)
+    case .title2:      return (20, .bold,    "Segoe UI", false)
+    case .title3:      return (18, .regular, "Segoe UI", false)
+    case .headline:    return (14, .bold,    "Segoe UI", false)
+    case .subheadline: return (12, .bold,    "Segoe UI", false)
+    case .body:        return (14, .regular, "Segoe UI", false)
+    case .callout:     return (12, .regular, "Segoe UI", false)
+    case .footnote:    return (10, .regular, "Segoe UI", false)
+    case .caption:     return (12, .regular, "Segoe UI", false)
+    case .caption2:    return (10, .bold,    "Segoe UI", false)
+    case .custom(let size, let w, let design):
+        return (Float(size), w, dwriteFontFamily(for: design), false)
     }
 }
 
@@ -740,9 +903,14 @@ func createD2DSurface<V: View>(
         d2d1_SolidColorBrush_SetColor(brush, 0, 0, 0, currentOpacity)
         // For text, use scaled font size for smooth scale animation
         if let text = view as? Text {
-            let (baseFontSize, bold, italic) = fontParametersForD2D(.body)
+            let (baseFontSize, baseWeight, family, italic) = fontParametersForD2D(.body)
             let scaledSize = baseFontSize * currentScale * dpiScale
-            if let fmt = D2DRenderer.shared.textFormat(fontSize: scaledSize, bold: bold, italic: italic) {
+            if let fmt = D2DRenderer.shared.textFormat(
+                fontFamily: family,
+                fontSize: scaledSize,
+                weight: dwriteFontWeight(for: baseWeight),
+                italic: italic
+            ) {
                 D2DRenderer.shared.drawText(text.content, target: rt, format: fmt,
                                              brush: brush, x: 0, y: 0, width: width, height: height)
             }
