@@ -5169,6 +5169,66 @@ extension Win32RenderTests {
         while PeekMessageW(&msg, testWindow, UINT(WM_NULL), UINT(WM_NULL), UINT(PM_REMOVE)) {
         }
     }
+
+    func testCanvasDrawingContextTranslateRotateAndDrawText() {
+        let ctx = testContext()
+        var painted = false
+        var transformed: (Float, Float, Float, Float, Float, Float)?
+        var restored: (Float, Float, Float, Float, Float, Float)?
+        var expectedDpi: Float = 1.0
+
+        let view = Canvas(width: 120, height: 180) { context, _, _ in
+            let d2dCtx = Unmanaged<D2DCanvasContext>.fromOpaque(
+                UnsafeMutableRawPointer(context.cr)
+            ).takeUnretainedValue()
+            expectedDpi = d2dCtx.m11
+
+            context.save()
+            context.translate(x: 60, y: 90)
+            context.rotate(-.pi / 2.0)
+            transformed = (d2dCtx.m11, d2dCtx.m12, d2dCtx.m21, d2dCtx.m22, d2dCtx.dx, d2dCtx.dy)
+
+            context.setColor(r: 1, g: 1, b: 1, a: 1)
+            context.drawText(
+                "Clean Code",
+                x: -60, y: -12, width: 120, height: 24,
+                fontSize: 12, alignment: .center, lineLimit: 2, strikethrough: true
+            )
+
+            context.restore()
+            restored = (d2dCtx.m11, d2dCtx.m12, d2dCtx.m21, d2dCtx.m22, d2dCtx.dx, d2dCtx.dy)
+            painted = true
+        }
+
+        let hwnd = winRenderView(view, in: ctx)
+        XCTAssertNotNil(hwnd)
+        guard let hwnd else { return }
+
+        _ = SendMessageW(hwnd, UINT(WM_PAINT), 0, 0)
+        XCTAssertTrue(painted, "Canvas draw closure should execute on WM_PAINT")
+
+        if let t = transformed {
+            XCTAssertEqual(t.0, 0, accuracy: 0.01)
+            XCTAssertEqual(t.1, -expectedDpi, accuracy: 0.01)
+            XCTAssertEqual(t.2, expectedDpi, accuracy: 0.01)
+            XCTAssertEqual(t.3, 0, accuracy: 0.01)
+            XCTAssertEqual(t.4, 60 * expectedDpi, accuracy: 0.05)
+            XCTAssertEqual(t.5, 90 * expectedDpi, accuracy: 0.05)
+        } else {
+            XCTFail("Expected transformed matrix")
+        }
+
+        if let r = restored {
+            XCTAssertEqual(r.0, expectedDpi, accuracy: 0.001)
+            XCTAssertEqual(r.1, 0, accuracy: 0.001)
+            XCTAssertEqual(r.2, 0, accuracy: 0.001)
+            XCTAssertEqual(r.3, expectedDpi, accuracy: 0.001)
+            XCTAssertEqual(r.4, 0, accuracy: 0.001)
+            XCTAssertEqual(r.5, 0, accuracy: 0.001)
+        } else {
+            XCTFail("Expected restored matrix")
+        }
+    }
 }
 
 private func findFirstViewHost(in parent: HWND, excluding: HWND) -> Win32ViewHost? {

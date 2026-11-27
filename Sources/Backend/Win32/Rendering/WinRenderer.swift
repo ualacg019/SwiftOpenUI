@@ -10499,6 +10499,92 @@ extension DrawingContext {
             c.m11, c.m12, c.m21, c.m22, c.dx, c.dy)
     }
 
+    public func translate(x: Double, y: Double) {
+        let c = ctx
+        let tx = Float(x), ty = Float(y)
+        c.dx += tx * c.m11 + ty * c.m21
+        c.dy += tx * c.m12 + ty * c.m22
+        d2d1_RenderTarget_SetTransform(c.renderTarget,
+            c.m11, c.m12, c.m21, c.m22, c.dx, c.dy)
+    }
+
+    public func rotate(_ angle: Double) {
+        let c = ctx
+        let cosA = Float(cos(angle))
+        let sinA = Float(sin(angle))
+        let nm11 = cosA * c.m11 + sinA * c.m21
+        let nm12 = cosA * c.m12 + sinA * c.m22
+        let nm21 = -sinA * c.m11 + cosA * c.m21
+        let nm22 = -sinA * c.m12 + cosA * c.m22
+        c.m11 = nm11; c.m12 = nm12
+        c.m21 = nm21; c.m22 = nm22
+        d2d1_RenderTarget_SetTransform(c.renderTarget,
+            c.m11, c.m12, c.m21, c.m22, c.dx, c.dy)
+    }
+
+    // MARK: - Text
+
+    public func drawText(
+        _ text: String,
+        x: Double,
+        y: Double,
+        width: Double,
+        height: Double,
+        fontSize: Double = 14,
+        weight: FontWeight = .regular,
+        design: FontDesign = .default,
+        italic: Bool = false,
+        alignment: TextAlignment = .leading,
+        lineLimit: Int? = nil,
+        truncationMode: TruncationMode = .tail,
+        strikethrough: Bool = false,
+        underline: Bool = false
+    ) {
+        guard !text.isEmpty, width > 0, height > 0 else { return }
+        let c = ctx
+        let family = dwriteFontFamily(for: design)
+        let dwWeight = dwriteFontWeight(for: weight)
+        guard let fmt = D2DRenderer.shared.textFormat(
+            fontFamily: family,
+            fontSize: Float(fontSize),
+            weight: dwWeight,
+            italic: italic
+        ) else { return }
+
+        c.applyColor()
+        let alignCode: Int
+        switch alignment {
+        case .leading:  alignCode = 0
+        case .trailing: alignCode = 1
+        case .center:   alignCode = 2
+        }
+        let maxLines = lineLimit ?? 0
+        let fw = Float(width)
+        let fh = Float(height)
+        let drawn = d2dTruncatedText(
+            text,
+            mode: truncationMode,
+            format: fmt,
+            maxWidth: fw,
+            maxHeight: fh,
+            maxLines: maxLines
+        )
+        D2DRenderer.shared.drawTextStyled(
+            drawn,
+            target: c.renderTarget,
+            format: fmt,
+            brush: c.brush,
+            x: Float(x),
+            y: Float(y),
+            width: fw,
+            height: fh,
+            alignment: alignCode,
+            maxLines: maxLines,
+            strikethrough: strikethrough,
+            underline: underline
+        )
+    }
+
     // MARK: - Path-based drawing (SwiftUI-compatible)
 
     /// Stroke a Path with the given shading and style.
