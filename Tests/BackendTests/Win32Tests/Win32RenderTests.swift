@@ -4950,6 +4950,34 @@ extension Win32RenderTests {
         XCTAssertEqual(bg.g, 0.45, accuracy: 0.03)
         XCTAssertEqual(bg.b, 0.92, accuracy: 0.03)
     }
+
+    func testCustomWindowClassesHaveArrowCursor() {
+        let ctx = testContext()
+        let vstack = winRenderView(VStack { Text("Hi").rotationEffect(.degrees(-90)) }, in: ctx)
+        let scroll = winRenderView(ScrollView { Text("S") }, in: ctx)
+        XCTAssertNotNil(vstack)
+        XCTAssertNotNil(scroll)
+
+        let expectedArrow = LoadCursorW(nil, win32_IDC_ARROW())
+        XCTAssertNotNil(expectedArrow)
+
+        if let vstack {
+            let stackCursor = GetClassLongPtrW(vstack, GCLP_HCURSOR)
+            XCTAssertEqual(stackCursor, ULONG_PTR(UInt(bitPattern: expectedArrow)))
+
+            if let d2d = findWindowByClass(in: vstack, className: "SwiftUID2DSurface") {
+                let d2dCursor = GetClassLongPtrW(d2d, GCLP_HCURSOR)
+                XCTAssertEqual(d2dCursor, ULONG_PTR(UInt(bitPattern: expectedArrow)))
+            } else {
+                XCTFail("Expected SwiftUID2DSurface child")
+            }
+        }
+
+        if let scroll {
+            let scrollCursor = GetClassLongPtrW(scroll, GCLP_HCURSOR)
+            XCTAssertEqual(scrollCursor, ULONG_PTR(UInt(bitPattern: expectedArrow)))
+        }
+    }
 }
 
 private func findFirstViewHost(in parent: HWND, excluding: HWND) -> Win32ViewHost? {

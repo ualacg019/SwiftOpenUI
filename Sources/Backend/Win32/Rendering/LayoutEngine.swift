@@ -679,6 +679,7 @@ func registerStackClassIfNeeded(hInstance: HINSTANCE) {
     wc.style = UINT(CS_HREDRAW | CS_VREDRAW)
     wc.lpfnWndProc = DefWindowProcW
     wc.hInstance = hInstance
+    wc.hCursor = LoadCursorW(nil, win32_IDC_ARROW())
     wc.hbrBackground = GetSysColorBrush(COLOR_WINDOW)
     wc.lpszClassName = stackContainerClassName
 

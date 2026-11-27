@@ -300,6 +300,7 @@ func registerNavClassIfNeeded(hInstance: HINSTANCE) {
     wc.style = UINT(CS_HREDRAW | CS_VREDRAW)
     wc.lpfnWndProc = navContainerWndProc
     wc.hInstance = hInstance
+    wc.hCursor = LoadCursorW(nil, win32_IDC_ARROW())
     wc.hbrBackground = GetSysColorBrush(COLOR_WINDOW)
     wc.lpszClassName = navContainerClassName
     RegisterClassExW(&wc)

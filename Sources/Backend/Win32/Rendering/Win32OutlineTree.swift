@@ -514,6 +514,7 @@ private func registerOutlineClassesIfNeeded(hInstance: HINSTANCE) {
     container.style = UINT(CS_HREDRAW | CS_VREDRAW)
     container.lpfnWndProc = outlineContainerProc
     container.hInstance = hInstance
+    container.hCursor = LoadCursorW(nil, win32_IDC_ARROW())
     container.hbrBackground = nil // erased via WM_ERASEBKGND (inherited)
     container.lpszClassName = outlineContainerClassName
     RegisterClassExW(&container)
@@ -523,6 +524,7 @@ private func registerOutlineClassesIfNeeded(hInstance: HINSTANCE) {
     content.style = UINT(CS_HREDRAW | CS_VREDRAW)
     content.lpfnWndProc = outlineContentProc
     content.hInstance = hInstance
+    content.hCursor = LoadCursorW(nil, win32_IDC_ARROW())
     content.hbrBackground = nil
     content.lpszClassName = outlineContentClassName
     RegisterClassExW(&content)

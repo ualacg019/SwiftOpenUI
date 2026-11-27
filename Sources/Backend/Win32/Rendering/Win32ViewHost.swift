@@ -570,6 +570,7 @@ public class Win32ViewHost: AnyViewHost, DependencyTrackingHost {
         wc.style = UINT(CS_HREDRAW | CS_VREDRAW)
         wc.lpfnWndProc = containerWndProc
         wc.hInstance = hInstance
+        wc.hCursor = LoadCursorW(nil, win32_IDC_ARROW())
         wc.hbrBackground = GetSysColorBrush(COLOR_WINDOW)
         wc.lpszClassName = containerClassName
 

@@ -608,6 +608,7 @@ private func registerD2DViewClassIfNeeded(hInstance: HINSTANCE) {
     wc.style = UINT(CS_HREDRAW | CS_VREDRAW)
     wc.lpfnWndProc = DefWindowProcW
     wc.hInstance = hInstance
+    wc.hCursor = LoadCursorW(nil, win32_IDC_ARROW())
     wc.hbrBackground = nil
     wc.lpszClassName = d2dViewClassName
     RegisterClassExW(&wc)
@@ -4210,6 +4211,7 @@ private func registerScrollViewClassIfNeeded(hInstance: HINSTANCE) {
     wc.style = UINT(CS_HREDRAW | CS_VREDRAW)
     wc.lpfnWndProc = scrollViewWndProc
     wc.hInstance = hInstance
+    wc.hCursor = LoadCursorW(nil, win32_IDC_ARROW())
     wc.hbrBackground = GetSysColorBrush(COLOR_WINDOW)
     wc.lpszClassName = scrollViewClassName
     RegisterClassExW(&wc)
@@ -7292,11 +7294,24 @@ private let splitViewLayoutProc: SUBCLASSPROC = { (hwnd, uMsg, wParam, lParam, u
         }
         return DefSubclassProc(hwnd, uMsg, wParam, lParam)
 
+    case UINT(WM_CAPTURECHANGED):
+        state.draggingDivider = 0
+        return DefSubclassProc(hwnd, uMsg, wParam, lParam)
+
     case UINT(WM_SETCURSOR):
-        // Let WM_MOUSEMOVE handle cursor changes for divider area
         if state.draggingDivider > 0 {
             SetCursor(LoadCursorW(nil, win32_IDC_SIZEWE()))
             return 1  // handled
+        }
+        if Int32(win32_LOWORD(DWORD_PTR(lParam))) == HTCLIENT,
+           HWND(bitPattern: Int(wParam)) == hwnd {
+            var pt = POINT()
+            GetCursorPos(&pt)
+            ScreenToClient(hwnd, &pt)
+            if state.hitTestDivider(x: pt.x) > 0 {
+                SetCursor(LoadCursorW(nil, win32_IDC_SIZEWE()))
+                return 1  // handled
+            }
         }
         return DefSubclassProc(hwnd, uMsg, wParam, lParam)
 
