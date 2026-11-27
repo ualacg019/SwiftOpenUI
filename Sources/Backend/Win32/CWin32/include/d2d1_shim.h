@@ -240,6 +240,24 @@ void d2d1_RenderTarget_DrawText(
     float x, float y, float width, float height
 );
 
+// Draw styled text via IDWriteTextLayout with alignment, wrapping,
+// max line limit, ellipsis trimming, strikethrough, underline, and clipping.
+// alignment: 0 = leading, 1 = trailing, 2 = center
+// maxLines:  0 = unlimited, >0 = clamp to at most maxLines lines
+void d2d1_RenderTarget_DrawTextStyled(
+    D2DRenderTarget target,
+    DWriteFactory dwriteFactory,
+    const WCHAR *text,
+    UINT32 textLength,
+    DWriteTextFormat format,
+    D2DBrush brush,
+    float x, float y, float width, float height,
+    int alignment,
+    int maxLines,
+    int strikethrough,
+    int underline
+);
+
 // Draw a line between two points
 void d2d1_RenderTarget_DrawLine(
     D2DRenderTarget target,

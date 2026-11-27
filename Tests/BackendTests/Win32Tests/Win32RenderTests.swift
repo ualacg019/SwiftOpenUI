@@ -4903,6 +4903,53 @@ extension Win32RenderTests {
         _ = SendMessageW(canvasHwnd, UINT(WM_LBUTTONUP), 0, LPARAM((35 & 0xFFFF) | ((35 & 0xFFFF) << 16)))
         pumpWindowMessages(for: testWindow, timeoutMs: 30)
     }
+
+    func testRotatedStyledFramedTextCreatesD2DSurfaceWithSwappedDimensions() {
+        let ctx = testContext()
+        let view = Text("Clean Code")
+            .font(.caption)
+            .foregroundColor(.white)
+            .strikethrough(true)
+            .multilineTextAlignment(.center)
+            .lineLimit(2)
+            .frame(width: 90, height: 28)
+            .rotationEffect(.degrees(-90))
+
+        let hwnd = winRenderView(view, in: ctx)
+        XCTAssertNotNil(hwnd)
+        guard let hwnd else { return }
+
+        XCTAssertEqual(className(of: hwnd), "SwiftUID2DSurface")
+        var rect = RECT()
+        GetWindowRect(hwnd, &rect)
+        let w = rect.right - rect.left
+        let h = rect.bottom - rect.top
+        XCTAssertGreaterThan(h, w * 2, "90-degree rotated 90x28 text should have height > width * 2")
+
+        _ = SendMessageW(hwnd, UINT(WM_PAINT), 0, 0)
+    }
+
+    func testD2DSurfaceInheritsBackgroundColor() {
+        let ctx = testContext()
+        let view = Text("Title")
+            .foregroundColor(.white)
+            .frame(width: 80, height: 24)
+            .rotationEffect(.degrees(-90))
+            .background(Color(red: 0.22, green: 0.45, blue: 0.92))
+
+        let root = winRenderView(view, in: ctx)
+        XCTAssertNotNil(root)
+        guard let root else { return }
+
+        let surface = findWindowByClass(in: root, className: "SwiftUID2DSurface")
+        XCTAssertNotNil(surface, "Expected SwiftUID2DSurface child inside background container")
+        guard let surface else { return }
+
+        let bg = inheritedBackgroundColor(for: surface)
+        XCTAssertEqual(bg.r, 0.22, accuracy: 0.03)
+        XCTAssertEqual(bg.g, 0.45, accuracy: 0.03)
+        XCTAssertEqual(bg.b, 0.92, accuracy: 0.03)
+    }
 }
 
 private func findFirstViewHost(in parent: HWND, excluding: HWND) -> Win32ViewHost? {

@@ -299,6 +299,105 @@ void d2d1_RenderTarget_DrawText(
     );
 }
 
+void d2d1_RenderTarget_DrawTextStyled(
+    D2DRenderTarget target,
+    DWriteFactory dwriteFactory,
+    const WCHAR *text,
+    UINT32 textLength,
+    DWriteTextFormat format,
+    D2DBrush brush,
+    float x, float y, float width, float height,
+    int alignment,
+    int maxLines,
+    int strikethrough,
+    int underline
+) {
+    if (!target || !dwriteFactory || !format || !brush || width <= 0.0f || height <= 0.0f) {
+        return;
+    }
+
+    IDWriteTextLayout *layout = nullptr;
+    HRESULT hr = AS_DWRITE_FACTORY(dwriteFactory)->CreateTextLayout(
+        text, textLength,
+        AS_TEXT_FORMAT(format),
+        width, height,
+        &layout
+    );
+    if (FAILED(hr) || !layout) {
+        return;
+    }
+
+    DWRITE_TEXT_ALIGNMENT dwriteAlign = DWRITE_TEXT_ALIGNMENT_LEADING;
+    if (alignment == 1) dwriteAlign = DWRITE_TEXT_ALIGNMENT_TRAILING;
+    else if (alignment == 2) dwriteAlign = DWRITE_TEXT_ALIGNMENT_CENTER;
+    layout->SetTextAlignment(dwriteAlign);
+
+    layout->SetWordWrapping(maxLines == 1 ? DWRITE_WORD_WRAPPING_NO_WRAP : DWRITE_WORD_WRAPPING_WRAP);
+
+    IDWriteInlineObject *trimmingSign = nullptr;
+    if (SUCCEEDED(AS_DWRITE_FACTORY(dwriteFactory)->CreateEllipsisTrimmingSign(AS_TEXT_FORMAT(format), &trimmingSign))) {
+        DWRITE_TRIMMING trimming = { DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0 };
+        layout->SetTrimming(&trimming, trimmingSign);
+        trimmingSign->Release();
+    }
+
+    float drawY = y;
+    float clipH = height;
+    bool clamped = false;
+
+    if (maxLines > 1) {
+        UINT32 lineCount = 0;
+        layout->GetLineMetrics(nullptr, 0, &lineCount);
+        if (lineCount > static_cast<UINT32>(maxLines)) {
+            DWRITE_LINE_METRICS stackMetrics[16];
+            DWRITE_LINE_METRICS *metrics = stackMetrics;
+            if (lineCount > 16) {
+                metrics = static_cast<DWRITE_LINE_METRICS *>(malloc(sizeof(DWRITE_LINE_METRICS) * lineCount));
+            }
+            if (metrics && SUCCEEDED(layout->GetLineMetrics(metrics, lineCount, &lineCount))) {
+                float cappedHeight = 0.0f;
+                for (UINT32 i = 0; i < static_cast<UINT32>(maxLines); ++i) {
+                    cappedHeight += metrics[i].height;
+                }
+                if (cappedHeight > 0.0f && cappedHeight < height) {
+                    layout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+                    layout->SetMaxHeight(cappedHeight);
+                    drawY = y + (height - cappedHeight) * 0.5f;
+                    clipH = cappedHeight;
+                    clamped = true;
+                }
+            }
+            if (metrics && metrics != stackMetrics) {
+                free(metrics);
+            }
+        }
+    }
+
+    if (!clamped) {
+        layout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    }
+
+    if (textLength > 0) {
+        DWRITE_TEXT_RANGE range = { 0, textLength };
+        if (strikethrough) layout->SetStrikethrough(TRUE, range);
+        if (underline) layout->SetUnderline(TRUE, range);
+    }
+
+    AS_TARGET(target)->PushAxisAlignedClip(
+        D2D1::RectF(x, drawY, x + width, drawY + clipH),
+        D2D1_ANTIALIAS_MODE_PER_PRIMITIVE
+    );
+    AS_TARGET(target)->DrawTextLayout(
+        D2D1::Point2F(x, drawY),
+        layout,
+        AS_BRUSH(brush),
+        D2D1_DRAW_TEXT_OPTIONS_NONE
+    );
+    AS_TARGET(target)->PopAxisAlignedClip();
+
+    layout->Release();
+}
+
 // --- WIC (Windows Imaging Component) ---
 
 #define AS_WIC_FACTORY(p) reinterpret_cast<IWICImagingFactory *>(p)

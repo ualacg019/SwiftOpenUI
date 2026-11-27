@@ -142,6 +142,33 @@ public class D2DRenderer {
         }
     }
 
+    /// Draw styled text via IDWriteTextLayout with alignment, wrapping, line limits,
+    /// ellipsis trimming, strikethrough, underline, and clipping.
+    public func drawTextStyled(
+        _ text: String,
+        target: D2DRenderTarget,
+        format: DWriteTextFormat,
+        brush: D2DBrush,
+        x: Float, y: Float, width: Float, height: Float,
+        alignment: Int = 0,
+        maxLines: Int = 0,
+        strikethrough: Bool = false,
+        underline: Bool = false
+    ) {
+        guard let dwf = dwriteFactory else {
+            drawText(text, target: target, format: format, brush: brush, x: x, y: y, width: width, height: height)
+            return
+        }
+        text.withCString(encodedAs: UTF16.self) { wstr in
+            d2d1_RenderTarget_DrawTextStyled(
+                target, dwf, wstr, UInt32(text.utf16.count),
+                format, brush, x, y, width, height,
+                Int32(alignment), Int32(maxLines),
+                strikethrough ? 1 : 0, underline ? 1 : 0
+            )
+        }
+    }
+
     // MARK: - Image loading (WIC)
 
     private var wicFactory: WICFactory?
