@@ -21,3 +21,10 @@ gallery-app/
 
 # Scaled GTK4 captures (screenshots/capture-linux-scaled.sh)
 screenshots/linux-scale-*/
+
+# Accidental root SwiftPM / resource bundle artifacts
+/Info.plist
+/MaterialSymbolsRounded-Regular.ttf
+
+# Android Gradle build outputs
+android/**/build/
