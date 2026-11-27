@@ -9290,17 +9290,30 @@ extension BlurView: WinRenderable {
 // The handler object is shared across all subclassed HWNDs. Each HWND holds
 // its own retain via Unmanaged.passRetained; WM_NCDESTROY releases it.
 
+private func isInteractiveTapChild(_ hwnd: HWND) -> Bool {
+    var refData: DWORD_PTR = 0
+    if GetWindowSubclass(hwnd, flatButtonProc, 48, &refData) {
+        return true
+    }
+    let cls = win32ClassName(hwnd)
+    return cls == "SwiftUICustomButton" || cls == "Button" || cls == "Edit"
+}
+
 /// Install a subclass proc recursively on an HWND and all its descendants.
 /// The handler is passRetained for each HWND, so WM_NCDESTROY must release.
 private func installGestureRecursively<T: AnyObject>(
-    on hwnd: HWND, handler: T, proc: SUBCLASSPROC, subclassID: UINT_PTR
+    on hwnd: HWND, handler: T, proc: SUBCLASSPROC, subclassID: UINT_PTR,
+    skipInteractiveChildren: Bool = false
 ) {
     let ptr = Unmanaged.passRetained(handler).toOpaque()
     SetWindowSubclass(hwnd, proc, subclassID, DWORD_PTR(UInt(bitPattern: ptr)))
 
     var child = GetWindow(hwnd, UINT(GW_CHILD))
     while let c = child {
-        installGestureRecursively(on: c, handler: handler, proc: proc, subclassID: subclassID)
+        if !(skipInteractiveChildren && isInteractiveTapChild(c)) {
+            installGestureRecursively(on: c, handler: handler, proc: proc, subclassID: subclassID,
+                                      skipInteractiveChildren: skipInteractiveChildren)
+        }
         child = GetWindow(c, UINT(GW_HWNDNEXT))
     }
 }
@@ -9316,7 +9329,8 @@ extension TapGestureView: WinRenderable {
         let handler = TapGestureHandler(requiredCount: count,
                                         action: bindActionToCurrentEnvironment(action))
         installGestureRecursively(on: hwnd, handler: handler,
-                                  proc: tapGestureProc, subclassID: tapGestureSubclassID)
+                                  proc: tapGestureProc, subclassID: tapGestureSubclassID,
+                                  skipInteractiveChildren: true)
         return hwnd
     }
 }
@@ -9362,15 +9376,15 @@ private let tapGestureProc: SUBCLASSPROC = { (hwnd, uMsg, wParam, lParam, uIdSub
             handler.action()
         } else {
             let doubleClickTime = GetDoubleClickTime()
-            if (now - handler.lastClickTime) <= doubleClickTime {
+            if handler.clickCount > 0 && (now &- handler.lastClickTime) <= doubleClickTime {
                 handler.clickCount += 1
             } else {
                 handler.clickCount = 1
             }
             handler.lastClickTime = now
             if handler.clickCount >= handler.requiredCount {
-                handler.action()
                 handler.clickCount = 0
+                handler.action()
             }
         }
         return DefSubclassProc(hwnd, uMsg, wParam, lParam)

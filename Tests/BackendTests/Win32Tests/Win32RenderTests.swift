@@ -4978,6 +4978,64 @@ extension Win32RenderTests {
             XCTAssertEqual(scrollCursor, ULONG_PTR(UInt(bitPattern: expectedArrow)))
         }
     }
+
+    func testDoubleTapGestureFiresOnSecondClick() {
+        let ctx = testContext()
+        var fired = 0
+        let view = VStack {
+            Text("Libro")
+                .frame(width: 80, height: 24)
+                .rotationEffect(.degrees(-90))
+        }.onTapGesture(count: 2) {
+            fired += 1
+        }
+
+        let root = winRenderView(view, in: ctx)
+        XCTAssertNotNil(root)
+        guard let root, let surface = findWindowByClass(in: root, className: "SwiftUID2DSurface") else {
+            XCTFail("Expected SwiftUID2DSurface child")
+            return
+        }
+
+        _ = SendMessageW(surface, UINT(WM_LBUTTONDOWN), WPARAM(MK_LBUTTON), 0)
+        _ = SendMessageW(surface, UINT(WM_LBUTTONUP), 0, 0)
+        XCTAssertEqual(fired, 0, "Single click must not trigger double-tap gesture")
+
+        _ = SendMessageW(surface, UINT(WM_LBUTTONDOWN), WPARAM(MK_LBUTTON), 0)
+        _ = SendMessageW(surface, UINT(WM_LBUTTONUP), 0, 0)
+        XCTAssertEqual(fired, 1, "Second click within double-click window should trigger action")
+    }
+
+    func testContainerDoubleTapSkipsChildButton() {
+        let ctx = testContext()
+        var buttonClicks = 0
+        var containerDoubleTaps = 0
+        let view = VStack {
+            Button("✓") {
+                buttonClicks += 1
+            }
+            .buttonStyle(.plain)
+            Text("Libro")
+        }.onTapGesture(count: 2) {
+            containerDoubleTaps += 1
+        }
+
+        let root = winRenderView(view, in: ctx)
+        XCTAssertNotNil(root)
+        guard let root, let btn = findFlatButton(in: root, titled: "✓") else {
+            XCTFail("Expected child FlatButton")
+            return
+        }
+
+        let clickPos = LPARAM((2 & 0xFFFF) | ((2 & 0xFFFF) << 16))
+        _ = SendMessageW(btn, UINT(WM_LBUTTONDOWN), WPARAM(MK_LBUTTON), clickPos)
+        _ = SendMessageW(btn, UINT(WM_LBUTTONUP), 0, clickPos)
+        _ = SendMessageW(btn, UINT(WM_LBUTTONDOWN), WPARAM(MK_LBUTTON), clickPos)
+        _ = SendMessageW(btn, UINT(WM_LBUTTONUP), 0, clickPos)
+
+        XCTAssertEqual(buttonClicks, 2, "Child button should still receive both clicks")
+        XCTAssertEqual(containerDoubleTaps, 0, "Double-clicking a child button must not trigger container double-tap")
+    }
 }
 
 private func findFirstViewHost(in parent: HWND, excluding: HWND) -> Win32ViewHost? {
